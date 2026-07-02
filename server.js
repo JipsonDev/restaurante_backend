@@ -32,7 +32,8 @@ const allowedOrigins = (process.env.CORS_ORIGIN || '*')
   .filter(Boolean);
 const corsOptions = {
   origin: allowedOrigins.includes('*') ? '*' : allowedOrigins,
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  credentials: true,
 };
 const httpServer = http.createServer(app);
 const io = new Server(httpServer, {
