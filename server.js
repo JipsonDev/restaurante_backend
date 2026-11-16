@@ -21,6 +21,7 @@ import notificacionesRoutes from './routes/notificaciones.js';
 import auditoriaRoutes from './routes/auditoria.js';
 import configuracionRoutes from './routes/configuracion.js';
 import impresionesRoutes from './routes/impresiones.js';
+import reservasRoutes, { ensureReservationsTable } from './routes/reservas.js';
 import { ensurePrintQueue } from './services/printQueue.js';
 import { verifyToken, JWT_SECRET } from './middleware/auth.js';
 import { attachSocketAuth } from './services/socketAuth.js';
@@ -80,6 +81,7 @@ app.use('/api/extras', verifyToken, extrasRoutes);
 app.use('/api/notificaciones', verifyToken, notificacionesRoutes);
 app.use('/api/auditoria', verifyToken, auditoriaRoutes);
 app.use('/api/configuracion', verifyToken, configuracionRoutes);
+app.use('/api/reservas', verifyToken, reservasRoutes);
 app.use('/api/impresiones', impresionesRoutes);
 
 const PORT = process.env.PORT || 3000;
@@ -87,6 +89,7 @@ try {
   await ensureAuditTable();
   await ensureBusinessConfigTable();
   await ensurePrintQueue();
+  await ensureReservationsTable();
 } catch (error) {
   console.warn('No se pudo preparar tablas auxiliares:', error.message);
 }
