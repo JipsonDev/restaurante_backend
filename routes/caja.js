@@ -278,22 +278,32 @@ async function mesaRealtimePayload(mesaId, extra = {}) {
 }
 
 router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, res) => {
+  // Las partes secundarias no deben tumbar la caja: si una falla se registra en el log
+  // (visible en Render) y se informa en `avisos`, y el resto del resumen se entrega igual.
+  const avisos = [];
+  const parte = async (nombre, fn, respaldo) => {
+    try { return await fn(); } catch (error) {
+      console.error(`[caja/resumen] ${nombre}:`, error.code || '', error.sqlMessage || error.message);
+      avisos.push({ parte: nombre, error: error.sqlMessage || error.message });
+      return respaldo;
+    }
+  };
   try {
-    await ensureCustomerFields();
-    await ensureCajaFields();
-    await ensurePaymentFields();
-    await ensureBillingTables();
+    await parte('preparar datos de clientes', () => ensureCustomerFields());
+    await parte('preparar caja', () => ensureCajaFields());
+    await parte('preparar pagos', () => ensurePaymentFields());
+    await parte('preparar facturación', () => ensureBillingTables());
     const caja = await getOpenCaja(req.user.id);
     const cajaId = caja?.id || 0;
     const totals = caja ? await cajaTotals(cajaId) : null;
-    const [[ventas]] = await pool.query(
+    const ventas = await parte('ventas del día', async () => (await pool.query(
       `SELECT COALESCE(SUM(monto), 0) AS total_cobrado,
               COUNT(*) AS pagos_hoy
        FROM pagos
        WHERE DATE(created_at) = CURDATE()
          AND COALESCE(estado, 'ACTIVO') = 'ACTIVO'`
-    );
-    const [[pendientes]] = await pool.query(
+    ))[0][0], { total_cobrado: 0, pagos_hoy: 0 });
+    const pendientes = await parte('cuentas por cobrar', async () => (await pool.query(
       `SELECT COUNT(*) AS pedidos_por_cobrar,
               COALESCE(SUM(GREATEST(total - (SELECT COALESCE(SUM(pg.monto),0) FROM pagos pg WHERE pg.pedido_id = pedidos.id AND COALESCE(pg.estado,'ACTIVO') = 'ACTIVO'),0)), 0) AS monto_por_cobrar
        FROM pedidos
@@ -304,8 +314,8 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
            WHERE dp.pedido_id = pedidos.id
              AND dp.cantidad > 0
          )`
-    );
-    const [pagos] = await pool.query(
+    ))[0][0], { pedidos_por_cobrar: 0, monto_por_cobrar: 0 });
+    const pagos = await parte('comprobantes del turno', async () => (await pool.query(
       `SELECT pg.id, pg.pedido_id, pg.caja_id, pg.monto, pg.metodo, pg.referencia, pg.factura_cliente, pg.comprobante_numero, pg.estado, pg.created_at, p.mesa_id, p.tipo, p.cliente_nombre, p.cliente_dato,
               p.delivery_telefono, p.delivery_direccion, p.delivery_referencia,
               m.numero AS mesa_numero
@@ -315,9 +325,8 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
        WHERE ${cajaId ? 'pg.caja_id = ?' : 'DATE(pg.created_at) = CURDATE()'}
        ORDER BY pg.created_at DESC
        LIMIT 30`, cajaId ? [cajaId] : []
-    );
-    const [movimientos] = cajaId
-      ? await pool.query(
+    ))[0], []);
+    const movimientos = cajaId ? await parte('movimientos de caja', async () => (await pool.query(
         `SELECT cm.*, t.nombre AS trabajador_nombre
          FROM caja_movimientos cm
          LEFT JOIN trabajadores t ON t.id = cm.trabajador_id
@@ -325,22 +334,21 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
          ORDER BY cm.created_at DESC
          LIMIT 30`,
         [cajaId]
-      )
-      : [[]];
-    const [cierres] = await pool.query(
+      ))[0], []) : [];
+    const cierres = await parte('cierres anteriores', async () => (await pool.query(
       `SELECT c.*, t.nombre AS trabajador_nombre
        FROM caja c
        LEFT JOIN trabajadores t ON t.id = c.trabajador_id
        WHERE c.estado = 'Cerrada'
        ORDER BY c.fecha_cierre DESC
        LIMIT 20`
-    );
-    const [clientes] = await pool.query(
+    ))[0], []);
+    const clientes = await parte('clientes de facturación', async () => (await pool.query(
       `SELECT id, documento, nombre, telefono, correo
        FROM clientes_facturacion
        ORDER BY updated_at DESC
        LIMIT 80`
-    );
+    ))[0], []);
     let divisiones = [];
     try {
       const [divisionRows] = await pool.query(
@@ -367,7 +375,10 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
       );
       divisiones = divisionRows;
     } catch (error) {
-      if (error.code !== 'ER_NO_SUCH_TABLE') throw error;
+      if (error.code !== 'ER_NO_SUCH_TABLE') {
+        console.error('[caja/resumen] divisiones de cuenta:', error.code || '', error.sqlMessage || error.message);
+        avisos.push({ parte: 'divisiones de cuenta', error: error.sqlMessage || error.message });
+      }
     }
 
     res.json({
@@ -383,11 +394,13 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
       movimientos,
       cierres,
       clientes,
-      siguiente_ticket: await peekComprobante('TICKET'),
-      siguiente_factura: await peekComprobante('FACTURA'),
+      siguiente_ticket: await parte('numeración de tickets', () => peekComprobante('TICKET'), null),
+      siguiente_factura: await parte('numeración de facturas', () => peekComprobante('FACTURA'), null),
+      avisos,
     });
   } catch (error) {
-    res.status(error.statusCode || 500).json({ error: error.message, message: error.message });
+    console.error('[caja/resumen]', error.code || '', error.sqlMessage || error.message);
+    res.status(error.statusCode || 500).json({ error: error.message, message: `No se pudo cargar la caja: ${error.sqlMessage || error.message}` });
   }
 });
 
