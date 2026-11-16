@@ -64,15 +64,18 @@ router.get('/:id', verifyRole('admin'), async (req, res) => {
 });
 
 router.post('/', verifyRole('admin'), async (req, res) => {
-  const { nombre, correo, password, rol = 'mesero', pin = null } = req.body;
+  const { nombre, correo, password, rol = 'mesero', pin = null, activo = 1 } = req.body;
 
-  if (!nombre || !correo || !password) {
+  if (!String(nombre || '').trim() || !String(correo || '').trim() || !password) {
     return res.status(400).json({ message: 'Nombre, correo y contrasena son obligatorios.' });
   }
 
   try {
     await ensureRoleColumn();
     const nextRole = roleOr400(rol);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(correo).trim())) return res.status(400).json({ message: 'Correo invalido.' });
+    if (![0,1].includes(Number(activo))) return res.status(400).json({ message: 'Estado invalido.' });
+    if (pin && !/^\d{4}$/.test(String(pin))) return res.status(400).json({ message: 'El PIN debe tener exactamente 4 digitos.' });
     const [existing] = await pool.query(
       'SELECT id FROM trabajadores WHERE correo = ?',
       [correo.toLowerCase().trim()]
@@ -85,8 +88,8 @@ router.post('/', verifyRole('admin'), async (req, res) => {
     const pinHash = pin ? await hashUniquePin(pin) : null;
     const [result] = await pool.query(
       `INSERT INTO trabajadores (nombre, correo, password_hash, pin_hash, rol, activo)
-       VALUES (?, ?, ?, ?, ?, 1)`,
-      [nombre, correo.toLowerCase().trim(), passwordHash, pinHash, nextRole]
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [nombre, correo.toLowerCase().trim(), passwordHash, pinHash, nextRole, Number(activo)]
     );
 
     res.status(201).json({ id: result.insertId, nombre, correo, rol: nextRole });
@@ -97,37 +100,38 @@ router.post('/', verifyRole('admin'), async (req, res) => {
 
 router.put('/:id', verifyRole('admin'), async (req, res) => {
   const { nombre, correo, rol, activo, password, pin } = req.body;
-
+  let conn;
   try {
     await ensureRoleColumn();
     const nextRole = rol !== undefined ? roleOr400(rol) : null;
-    if (password) {
-      const passwordHash = await bcrypt.hash(password, 10);
-      await pool.query(
-        'UPDATE trabajadores SET password_hash = ? WHERE id = ?',
-        [passwordHash, req.params.id]
-      );
+    if (nombre !== undefined && !String(nombre || '').trim()) return res.status(400).json({ message: 'Nombre obligatorio.' });
+    if (correo !== undefined && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(correo).trim())) return res.status(400).json({ message: 'Correo invalido.' });
+    if (activo !== undefined && ![0,1].includes(Number(activo))) return res.status(400).json({ message: 'Estado invalido.' });
+    if (Number(req.params.id) === Number(req.user.id) && ((activo !== undefined && Number(activo) === 0) || (nextRole && nextRole !== 'admin'))) return res.status(409).json({ message: 'No puedes desactivar tu propio usuario ni quitarte el rol de administrador.' });
+    if (pin && !/^\d{4}$/.test(String(pin))) return res.status(400).json({ message: 'El PIN debe tener exactamente 4 digitos.' });
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+    const [[worker]] = await conn.query('SELECT id FROM trabajadores WHERE id = ? FOR UPDATE', [req.params.id]);
+    if (!worker) { await conn.rollback(); return res.status(404).json({ message: 'Trabajador no encontrado.' }); }
+    const email = correo === undefined ? null : String(correo).trim().toLowerCase();
+    if (email) {
+      const [duplicate] = await conn.query('SELECT id FROM trabajadores WHERE correo = ? AND id <> ?', [email, req.params.id]);
+      if (duplicate.length) { await conn.rollback(); return res.status(409).json({ message: 'Ya existe un usuario con ese correo.' }); }
     }
-    if (pin !== undefined) {
-      const pinHash = String(pin || '').trim() ? await hashUniquePin(pin, { excludeUserId: req.params.id }) : null;
-      await pool.query(
-        'UPDATE trabajadores SET pin_hash = ? WHERE id = ?',
-        [pinHash, req.params.id]
-      );
-    }
-    await pool.query(
-      `UPDATE trabajadores
-       SET nombre = COALESCE(?, nombre),
-           correo = COALESCE(?, correo),
-           rol = COALESCE(?, rol),
-           activo = COALESCE(?, activo)
-       WHERE id = ?`,
-      [nombre, correo, nextRole, activo, req.params.id]
+    const passwordHash = password ? await bcrypt.hash(password, 10) : null;
+    const pinHash = pin ? await hashUniquePin(pin, { excludeUserId: req.params.id, db: conn }) : null;
+    await conn.query(
+      `UPDATE trabajadores SET nombre = COALESCE(?, nombre), correo = COALESCE(?, correo),
+        rol = COALESCE(?, rol), activo = COALESCE(?, activo), password_hash = COALESCE(?, password_hash),
+        pin_hash = IF(? = 1, ?, pin_hash) WHERE id = ?`,
+      [nombre === undefined ? null : String(nombre).trim(), email, nextRole, activo ?? null, passwordHash, pin !== undefined ? 1 : 0, pinHash, req.params.id]
     );
+    await conn.commit();
     res.json({ message: 'Trabajador actualizado.' });
   } catch (error) {
-    res.status(error.statusCode || 500).json({ message: error.message });
-  }
+    if (conn) await conn.rollback();
+    res.status(error.code === 'ER_DUP_ENTRY' ? 409 : error.statusCode || 500).json({ message: error.code === 'ER_DUP_ENTRY' ? 'Ya existe un usuario con ese correo.' : error.message });
+  } finally { conn?.release(); }
 });
 
 router.delete('/:id', verifyRole('admin'), async (req, res) => {

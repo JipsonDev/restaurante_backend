@@ -1,4 +1,5 @@
 import { pool } from '../db.js';
+import { normalizeBusinessConfigPatch } from './businessConfigValidation.js';
 
 const DEFAULT_CONFIG = {
   nombre_restaurante: 'Morena Mia',
@@ -15,6 +16,9 @@ const DEFAULT_CONFIG = {
   texto_ticket: 'Gracias por su compra',
   impresora_caja: '',
   impresora_cocina: '',
+  alertas_demora_activas: '1',
+  alerta_espera_minutos: '20',
+  alerta_lista_minutos: '5',
 };
 
 let ready = false;
@@ -49,7 +53,7 @@ export async function getBusinessConfig(db = pool) {
 export async function setBusinessConfig(values = {}, db = pool) {
   await ensureBusinessConfigTable(db);
   const allowed = Object.keys(DEFAULT_CONFIG);
-  const entries = Object.entries(values).filter(([key]) => allowed.includes(key));
+  const entries = Object.entries(normalizeBusinessConfigPatch(values, allowed));
   if (!entries.length) return getBusinessConfig(db);
 
   await db.query(

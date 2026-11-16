@@ -1,15 +1,21 @@
+import paymentHistory from './paymentHistory.js';
+import { paymentPlan, paymentError, cents, parseSnapshot, allocatePayment } from '../services/paymentLedger.js';
+import { cashAmount, validateMethod, expectedCash, receiptTotals } from '../services/cashLogic.js';
 import express from 'express';
+import { beginAccountTransaction, emitMergedAccounts, consolidateAccount } from '../services/accounts.js';
+import { refreshAccountState } from '../services/rounds.js';
 import { pool } from '../db.js';
 import { getPedidoCompleto, transitionPedido } from './pedidos.js';
 import { emitRealtime, EVENTS } from '../realtime.js';
 import { getMesaPayload } from '../services/tableState.js';
-import { safeLogAudit } from '../services/audit.js';
+import { ensureAuditTable, safeLogAudit } from '../services/audit.js';
 import { getBusinessConfig } from '../services/businessConfig.js';
 import { verifyRole } from '../middleware/auth.js';
 import { requirePermission } from '../services/permissions.js';
 import { resolveQuickAuthorization } from '../services/quickPin.js';
 
 const router = express.Router();
+router.use('/pagos', paymentHistory);
 let customerFieldsReady = false;
 let cajaFieldsReady = false;
 let paymentFieldsReady = false;
@@ -60,6 +66,20 @@ async function ensurePaymentFields() {
   await addColumnIfMissing('pagos', 'motivo_anulacion', 'ALTER TABLE pagos ADD COLUMN motivo_anulacion VARCHAR(255) NULL');
   await addColumnIfMissing('pagos', 'anulado_por', 'ALTER TABLE pagos ADD COLUMN anulado_por INT NULL');
   await addColumnIfMissing('pagos', 'anulado_at', 'ALTER TABLE pagos ADD COLUMN anulado_at DATETIME NULL');
+  await addColumnIfMissing('pagos', 'trabajador_id', 'ALTER TABLE pagos ADD COLUMN trabajador_id INT NULL');
+  await addColumnIfMissing('pagos', 'division_id', 'ALTER TABLE pagos ADD COLUMN division_id INT NULL');
+  await addColumnIfMissing('pagos', 'idempotency_key', 'ALTER TABLE pagos ADD COLUMN idempotency_key VARCHAR(80) NULL, ADD UNIQUE INDEX uq_pago_request (idempotency_key)');
+  await addColumnIfMissing('pagos', 'request_fingerprint', 'ALTER TABLE pagos ADD COLUMN request_fingerprint LONGTEXT NULL');
+  await addColumnIfMissing('pagos', 'comprobante_snapshot', 'ALTER TABLE pagos ADD COLUMN comprobante_snapshot LONGTEXT NULL');
+  await addColumnIfMissing('pagos', 'impresion_estado', "ALTER TABLE pagos ADD COLUMN impresion_estado VARCHAR(16) NOT NULL DEFAULT 'PENDIENTE'");
+  await addColumnIfMissing('pagos', 'impresion_intentos', 'ALTER TABLE pagos ADD COLUMN impresion_intentos INT NOT NULL DEFAULT 0');
+  await addColumnIfMissing('pagos', 'impresion_error', 'ALTER TABLE pagos ADD COLUMN impresion_error VARCHAR(255) NULL');
+  await addColumnIfMissing('pagos', 'impresion_at', 'ALTER TABLE pagos ADD COLUMN impresion_at DATETIME NULL');
+  await pool.query(`CREATE TABLE IF NOT EXISTS pago_desglose (
+    id INT AUTO_INCREMENT PRIMARY KEY, pago_id INT NOT NULL, metodo VARCHAR(30) NOT NULL,
+    monto DECIMAL(10,2) NOT NULL, referencia VARCHAR(255) NULL,
+    INDEX idx_pago_desglose_pago (pago_id)
+  ) ENGINE=InnoDB`);
   paymentFieldsReady = true;
 }
 
@@ -113,7 +133,17 @@ async function ensureBillingTables() {
   await addColumnIfMissing('caja', 'total_ingresos', 'ALTER TABLE caja ADD COLUMN total_ingresos DECIMAL(10,2) NOT NULL DEFAULT 0');
   await addColumnIfMissing('caja', 'total_retiros', 'ALTER TABLE caja ADD COLUMN total_retiros DECIMAL(10,2) NOT NULL DEFAULT 0');
   await addColumnIfMissing('caja', 'total_gastos', 'ALTER TABLE caja ADD COLUMN total_gastos DECIMAL(10,2) NOT NULL DEFAULT 0');
+  await pool.query('CREATE TABLE IF NOT EXISTS caja_control (id INT PRIMARY KEY) ENGINE=InnoDB');
+  await pool.query('INSERT IGNORE INTO caja_control (id) VALUES (1)');
   billingTablesReady = true;
+}
+
+export async function initializeCashSchema() {
+  await ensureAuditTable();
+  await ensureCustomerFields();
+  await ensureCajaFields();
+  await ensurePaymentFields();
+  await ensureBillingTables();
 }
 
 function cleanInvoiceDocument(value) {
@@ -159,16 +189,22 @@ async function upsertClienteFacturacion(conn, { documento, nombre, telefono = nu
   return cliente?.id || null;
 }
 
-async function cajaTotals(cajaId, db = pool) {
+export async function cajaTotals(cajaId, db = pool) {
   const [[payments]] = await db.query(
     `SELECT
         COALESCE(SUM(CASE WHEN metodo = 'Efectivo' THEN monto ELSE 0 END), 0) AS efectivo,
         COALESCE(SUM(CASE WHEN metodo = 'Tarjeta' THEN monto ELSE 0 END), 0) AS tarjeta,
         COALESCE(SUM(CASE WHEN metodo = 'Transferencia' THEN monto ELSE 0 END), 0) AS transferencia,
         COALESCE(SUM(CASE WHEN metodo = 'QR' THEN monto ELSE 0 END), 0) AS qr,
+        COALESCE(SUM(CASE WHEN metodo = 'Vales' THEN monto ELSE 0 END), 0) AS vales,
+        COALESCE(SUM(CASE WHEN metodo = 'Otro' THEN monto ELSE 0 END), 0) AS otro,
         COALESCE(SUM(monto), 0) AS total,
-        COUNT(*) AS pagos
-     FROM pagos
+        COUNT(DISTINCT pago_id) AS pagos
+     FROM (
+       SELECT pg.id AS pago_id, pg.caja_id, pg.estado, COALESCE(pd.metodo, pg.metodo) AS metodo,
+         COALESCE(pd.monto, pg.monto) AS monto
+       FROM pagos pg LEFT JOIN pago_desglose pd ON pd.pago_id = pg.id
+     ) payment_parts
      WHERE caja_id = ?
        AND COALESCE(estado, 'ACTIVO') = 'ACTIVO'`,
     [cajaId]
@@ -179,13 +215,21 @@ async function cajaTotals(cajaId, db = pool) {
         COALESCE(SUM(CASE WHEN tipo = 'RETIRO' THEN monto ELSE 0 END), 0) AS retiros,
         COALESCE(SUM(CASE WHEN tipo = 'GASTO' THEN monto ELSE 0 END), 0) AS gastos,
         COALESCE(SUM(CASE WHEN tipo = 'DEVOLUCION' THEN monto ELSE 0 END), 0) AS devoluciones,
-        COALESCE(SUM(CASE WHEN tipo = 'ANULACION' THEN monto ELSE 0 END), 0) AS anulaciones
+        COALESCE(SUM(CASE WHEN tipo = 'ANULACION' THEN monto ELSE 0 END), 0) AS anulaciones,
+        COALESCE(SUM(CASE WHEN tipo = 'INGRESO' AND metodo = 'Efectivo' THEN monto ELSE 0 END), 0) AS ingresos_efectivo,
+        COALESCE(SUM(CASE WHEN tipo = 'RETIRO' AND metodo = 'Efectivo' THEN monto ELSE 0 END), 0) AS retiros_efectivo,
+        COALESCE(SUM(CASE WHEN tipo = 'GASTO' AND metodo = 'Efectivo' THEN monto ELSE 0 END), 0) AS gastos_efectivo
      FROM caja_movimientos
      WHERE caja_id = ?`,
     [cajaId]
   );
   return {
     efectivo: Number(payments.efectivo || 0),
+    vales: Number(payments.vales || 0),
+    otro: Number(payments.otro || 0),
+    ingresos_efectivo: Number(moves.ingresos_efectivo || 0),
+    retiros_efectivo: Number(moves.retiros_efectivo || 0),
+    gastos_efectivo: Number(moves.gastos_efectivo || 0),
     tarjeta: Number(payments.tarjeta || 0),
     transferencia: Number(payments.transferencia || 0),
     qr: Number(payments.qr || 0),
@@ -211,6 +255,19 @@ async function getOpenCaja(trabajadorId, db = pool) {
   return rows[0] || null;
 }
 
+// One shared register is the existing business rule. This row serializes its mutations,
+// including opening while no caja row exists yet, across processes and devices.
+export async function lockCashRegister(conn, expectedId = null) {
+  await conn.query('SELECT id FROM caja_control WHERE id = 1 FOR UPDATE');
+  const caja = await getOpenCaja(null, conn);
+  if (expectedId != null && (!caja || Number(caja.id) !== Number(expectedId))) {
+    const error = new Error('La caja cambio o ya se cerro. Actualiza antes de continuar.');
+    error.statusCode = 409;
+    throw error;
+  }
+  return caja;
+}
+
 async function mesaRealtimePayload(mesaId, extra = {}) {
   if (!mesaId) return { mesa_id: null, ...extra };
   let mesa = null;
@@ -228,6 +285,7 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
     await ensureBillingTables();
     const caja = await getOpenCaja(req.user.id);
     const cajaId = caja?.id || 0;
+    const totals = caja ? await cajaTotals(cajaId) : null;
     const [[ventas]] = await pool.query(
       `SELECT COALESCE(SUM(monto), 0) AS total_cobrado,
               COUNT(*) AS pagos_hoy
@@ -237,10 +295,9 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
     );
     const [[pendientes]] = await pool.query(
       `SELECT COUNT(*) AS pedidos_por_cobrar,
-              COALESCE(SUM(total), 0) AS monto_por_cobrar
+              COALESCE(SUM(GREATEST(total - (SELECT COALESCE(SUM(pg.monto),0) FROM pagos pg WHERE pg.pedido_id = pedidos.id AND COALESCE(pg.estado,'ACTIVO') = 'ACTIVO'),0)), 0) AS monto_por_cobrar
        FROM pedidos
-       WHERE DATE(created_at) = CURDATE()
-         AND estado NOT IN ('PAGADO', 'CANCELADO')
+       WHERE estado NOT IN ('PAGADO', 'CANCELADO')
          AND EXISTS (
            SELECT 1
            FROM detalle_pedidos dp
@@ -249,15 +306,15 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
          )`
     );
     const [pagos] = await pool.query(
-      `SELECT pg.*, p.mesa_id, p.tipo, p.cliente_nombre, p.cliente_dato,
+      `SELECT pg.id, pg.pedido_id, pg.caja_id, pg.monto, pg.metodo, pg.referencia, pg.factura_cliente, pg.comprobante_numero, pg.estado, pg.created_at, p.mesa_id, p.tipo, p.cliente_nombre, p.cliente_dato,
               p.delivery_telefono, p.delivery_direccion, p.delivery_referencia,
               m.numero AS mesa_numero
        FROM pagos pg
        LEFT JOIN pedidos p ON pg.pedido_id = p.id
        LEFT JOIN mesas m ON p.mesa_id = m.id
-       WHERE DATE(pg.created_at) = CURDATE()
+       WHERE ${cajaId ? 'pg.caja_id = ?' : 'DATE(pg.created_at) = CURDATE()'}
        ORDER BY pg.created_at DESC
-       LIMIT 30`
+       LIMIT 30`, cajaId ? [cajaId] : []
     );
     const [movimientos] = cajaId
       ? await pool.query(
@@ -306,7 +363,7 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
                AND dp.cantidad > 0
            )
          ORDER BY cd.created_at DESC, cd.id ASC
-         LIMIT 80`
+         `
       );
       divisiones = divisionRows;
     } catch (error) {
@@ -315,6 +372,8 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
 
     res.json({
       caja,
+      totales_turno: totals,
+      efectivo_esperado: caja ? expectedCash(caja.monto_inicial, totals) : null,
       total_cobrado: Number(ventas.total_cobrado || 0),
       pagos_hoy: Number(ventas.pagos_hoy || 0),
       pedidos_por_cobrar: Number(pendientes.pedidos_por_cobrar || 0),
@@ -328,7 +387,7 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
       siguiente_factura: await peekComprobante('FACTURA'),
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message, message: error.message });
   }
 });
 
@@ -347,39 +406,46 @@ router.get('/clientes', verifyRole('admin', 'caja', 'supervisor'), async (req, r
     );
     res.json(rows);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message, message: error.message });
   }
 });
 
 router.post('/abrir', requirePermission('cash_open_close'), async (req, res) => {
   const { monto_inicial = 0, observacion = null } = req.body;
-
+  let conn;
   try {
+    const initial = cashAmount(monto_inicial);
     await ensureCajaFields();
-    const existing = await getOpenCaja(req.user.id);
-    if (existing) return res.json(existing);
+    await ensureBillingTables();
+    conn = await pool.getConnection();
+    await beginAccountTransaction(conn);
+    const existing = await lockCashRegister(conn);
+    if (existing) { await conn.commit(); return res.json(existing); }
 
-    const [result] = await pool.query(
+    const [result] = await conn.query(
       `INSERT INTO caja (trabajador_id, monto_inicial, estado, fecha_apertura, observacion_apertura)
        VALUES (?, ?, 'Abierta', NOW(), ?)`,
-      [req.user.id, Number(monto_inicial || 0), observacion ? String(observacion).trim() : null]
+      [req.user.id, initial, observacion ? String(observacion).trim() : null]
     );
 
-    const caja = await getOpenCaja(req.user.id);
+    const caja = await getOpenCaja(req.user.id, conn);
     const payload = { ...caja, id: result.insertId };
     await safeLogAudit({
+      conn,
       user: req.user,
       accion: 'caja.abierta',
       entidad: 'caja',
       entidadId: result.insertId,
       descripcion: 'Caja abierta',
-      metadata: { monto_inicial: Number(monto_inicial || 0), observacion },
+      metadata: { monto_inicial: initial, observacion },
     });
+    await conn.commit();
     emitRealtime(EVENTS.CASH_UPDATED, { action: 'opened', caja: payload });
     res.status(201).json(payload);
   } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    if (conn) await conn.rollback();
+    res.status(error.statusCode || 500).json({ message: error.message });
+  } finally { conn?.release(); }
 });
 
 router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
@@ -393,7 +459,6 @@ router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
     factura_documento = null,
     factura_telefono = null,
     factura_correo = null,
-    iva_declarado = 0,
   } = req.body;
   if (!pedido_id) return res.status(400).json({ message: 'pedido_id es obligatorio.' });
 
@@ -409,18 +474,39 @@ router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
 
   let conn;
   try {
+    paymentPlan(req.body, monto, 0); // Validate the requested breakdown before acquiring locks.
+    const requestKey = req.body.idempotency_key || null;
+    if (requestKey && !/^[A-Za-z0-9_-]{16,80}$/.test(requestKey)) throw paymentError('Identificador de cobro invalido.');
+    if ((req.body.parcial || metodo === 'Mixto' || req.body.division_id) && !requestKey) throw paymentError('Este cobro necesita un identificador para evitar duplicados.');
+    const fingerprint = JSON.stringify({ pedido_id: Number(pedido_id), metodo, monto: cashAmount(monto), caja_id: Number(req.body.caja_id || 0),
+      parcial: !!req.body.parcial, division_id: Number(req.body.division_id || 0), desglose: req.body.desglose || null,
+      recibido: req.body.efectivo_recibido ?? null, referencia, invoiceType, invoiceClient, invoiceDocument, factura_telefono, factura_correo });
     await ensureCajaFields();
     await ensurePaymentFields();
     await ensureBillingTables();
+    const businessConfig = await getBusinessConfig();
     conn = await pool.getConnection();
-    await conn.beginTransaction();
+    await beginAccountTransaction(conn);
 
-    let caja = await getOpenCaja(req.user.id, conn);
+    const caja = await lockCashRegister(conn);
+    if (requestKey) {
+      const [[existing]] = await conn.query('SELECT * FROM pagos WHERE idempotency_key = ? FOR UPDATE', [requestKey]);
+      if (existing) {
+        if (existing.request_fingerprint !== fingerprint) throw paymentError('Este identificador ya se uso con otro cobro.', 409);
+        const snapshot = parseSnapshot(existing.comprobante_snapshot);
+        const current = await getPedidoCompleto(existing.pedido_id, conn);
+        await conn.commit();
+        return res.json({ message: 'Cobro ya registrado.', replayed: true, pago_id: existing.id, pago: { id: existing.id, estado: existing.estado, motivo_anulacion: existing.motivo_anulacion }, pedido: current,
+          monto: Number(existing.monto), comprobante_numero: existing.comprobante_numero, snapshot });
+      }
+    }
+    if (req.body.caja_id && Number(caja?.id) !== Number(req.body.caja_id)) throw paymentError('La caja cambio. Actualiza antes de cobrar.', 409);
     if (!caja) {
       await conn.rollback();
       return res.status(403).json({ message: 'Debes abrir caja antes de cobrar.' });
     }
 
+    const account = await consolidateAccount(conn, Number(pedido_id));
     const [[pedido]] = await conn.query('SELECT * FROM pedidos WHERE id = ? FOR UPDATE', [pedido_id]);
     if (!pedido) {
       await conn.rollback();
@@ -431,23 +517,20 @@ router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
       return res.status(409).json({ message: `Este pedido ya esta ${pedido.estado}.` });
     }
 
-    const [[existingPayment]] = await conn.query(
-      "SELECT id FROM pagos WHERE pedido_id = ? AND COALESCE(estado, 'ACTIVO') = 'ACTIVO' LIMIT 1",
-      [pedido_id]
-    );
-    if (existingPayment) {
-      await conn.rollback();
-      return res.status(409).json({ message: 'Este pedido ya tiene un pago registrado.' });
+    const [[balance]] = await conn.query("SELECT COALESCE(SUM(monto),0) AS abonado, COALESCE(SUM(JSON_EXTRACT(comprobante_snapshot, '$.asignacion.subtotal')),0) AS subtotal, COALESCE(SUM(JSON_EXTRACT(comprobante_snapshot, '$.asignacion.tax')),0) AS tax, COALESCE(SUM(JSON_EXTRACT(comprobante_snapshot, '$.asignacion.service')),0) AS service FROM pagos WHERE pedido_id = ? AND COALESCE(estado, 'ACTIVO') = 'ACTIVO'", [pedido_id]);
+    const plan = paymentPlan(req.body, pedido.total, balance.abonado);
+    const amount = plan.amount;
+    let division = null;
+    if (req.body.division_id) {
+      const [[part]] = await conn.query('SELECT * FROM cuenta_divisiones WHERE id = ? AND pedido_id = ? FOR UPDATE', [req.body.division_id, pedido_id]);
+      if (!part || part.estado !== 'PENDIENTE' || cents(part.monto) !== cents(amount)) throw paymentError('La parte elegida ya se cobro o su monto cambio.', 409);
+      division = part;
     }
-
-    const amount = Number(monto || pedido.total || 0);
-    if (amount <= 0) {
-      await conn.rollback();
-      return res.status(400).json({ message: 'El monto a cobrar debe ser mayor a cero.' });
-    }
-    const businessConfig = await getBusinessConfig(conn);
-    const taxRate = Math.max(0, Number(businessConfig.iva_porcentaje || 0)) / 100;
-    const subtotal = taxRate > 0 ? amount / (1 + taxRate) : amount;
+    const orderSnapshot = await getPedidoCompleto(pedido_id, conn);
+    const receipt = receiptTotals(orderSnapshot, businessConfig.iva_porcentaje);
+    const allocation = allocatePayment(receipt, amount, balance);
+    const subtotal = allocation.subtotal;
+    const paymentTax = allocation.tax;
     const comprobanteTipo = invoiceType === 'DOCUMENTO' ? 'FACTURA' : 'TICKET';
     const comprobanteNumero = await nextComprobante(conn, comprobanteTipo);
     const clienteId = invoiceType === 'DOCUMENTO'
@@ -458,7 +541,7 @@ router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
         correo: factura_correo ? String(factura_correo).trim() : null,
       })
       : null;
-    await conn.query(
+    const [savedPayment] = await conn.query(
       `INSERT INTO pagos (
          pedido_id, caja_id, monto, metodo, referencia,
          factura_tipo, factura_cliente, factura_documento, iva_declarado,
@@ -474,14 +557,29 @@ router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
         invoiceType,
         invoiceClient,
         invoiceType === 'DOCUMENTO' ? invoiceDocument : null,
-        invoiceType === 'DOCUMENTO' ? Number(iva_declarado || 0) : 0,
+        invoiceType === 'DOCUMENTO' ? paymentTax : 0,
         comprobanteTipo,
         comprobanteNumero,
         clienteId,
         subtotal,
       ]
     );
-    const transition = await transitionPedido(conn, pedido_id, 'PAGADO', { allowShortcut: true });
+    const paymentId = savedPayment.insertId;
+    for (const part of plan.parts) await conn.query('INSERT INTO pago_desglose (pago_id, metodo, monto, referencia) VALUES (?, ?, ?, ?)', [paymentId, part.metodo, part.monto, part.referencia]);
+    const snapshot = { version: 1, pedido: orderSnapshot, totales: receipt, negocio: businessConfig,
+      created_at: new Date().toISOString(), monto: amount, asignacion: allocation, abonado_anterior: plan.paidBefore, saldo_pendiente: plan.remaining,
+      efectivo_recibido: plan.received, cambio: plan.change, desglose: plan.parts, metodo,
+      division: division ? { id: division.id, nombre: division.nombre } : null,
+      comprobante_numero: comprobanteNumero, comprobante_tipo: comprobanteTipo,
+      cliente: { nombre: invoiceClient, documento: invoiceType === 'DOCUMENTO' ? invoiceDocument : null, telefono: factura_telefono, correo: factura_correo },
+      cajero: { id: req.user.id, nombre: req.user.nombre } };
+    await conn.query(`UPDATE pagos SET trabajador_id = ?, division_id = ?, idempotency_key = ?, request_fingerprint = ?, comprobante_snapshot = ? WHERE id = ?`,
+      [req.user.id, division?.id || null, requestKey, fingerprint, JSON.stringify(snapshot), paymentId]);
+    const transition = plan.complete ? await transitionPedido(conn, pedido_id, 'PAGADO', { allowShortcut: true }) : { mesa_id: pedido.mesa_id, table_freed: false };
+    if (transition.mesa_id && !transition.table_freed) await conn.query("UPDATE mesas SET estado = 'Ocupada' WHERE id = ?", [transition.mesa_id]);
+    if (plan.complete) await conn.query("UPDATE cuenta_divisiones SET estado = 'PAGADO' WHERE pedido_id = ?", [pedido_id]);
+    else if (division) await conn.query("UPDATE cuenta_divisiones SET estado = 'PAGADO' WHERE id = ?", [division.id]);
+    else await conn.query("DELETE FROM cuenta_divisiones WHERE pedido_id = ? AND estado = 'PENDIENTE'", [pedido_id]);
     await conn.query(
       `UPDATE caja
        SET total_ventas = COALESCE(total_ventas, 0) + ?
@@ -494,7 +592,7 @@ router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
       accion: 'caja.cobro_registrado',
       entidad: 'pedido',
       entidadId: Number(pedido_id),
-      descripcion: 'Pedido cobrado y cerrado',
+      descripcion: plan.complete ? 'Cuenta liquidada' : 'Abono registrado',
       metadata: {
         monto: amount,
         metodo,
@@ -503,14 +601,15 @@ router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
         factura_tipo: invoiceType,
         factura_cliente: invoiceClient,
         factura_documento: invoiceType === 'DOCUMENTO' ? invoiceDocument : null,
-        iva_declarado: invoiceType === 'DOCUMENTO' ? Number(iva_declarado || 0) : 0,
+        iva_declarado: invoiceType === 'DOCUMENTO' ? paymentTax : 0,
         comprobante_tipo: comprobanteTipo,
         comprobante_numero: comprobanteNumero,
       },
     });
 
+    const pedidoActualizado = { ...await getPedidoCompleto(pedido_id, conn), totales_cobro: receipt };
     await conn.commit();
-    const pedidoActualizado = await getPedidoCompleto(pedido_id);
+    emitMergedAccounts(account.orders, Number(pedido_id));
     emitRealtime(EVENTS.PAYMENT_CREATED, { pedido_id, monto: amount, metodo, pedido: pedidoActualizado });
     emitRealtime(EVENTS.ORDER_UPDATED, { pedido: pedidoActualizado, pedido_id, transition });
     if (transition.table_freed) {
@@ -520,16 +619,18 @@ router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
       }));
     }
     res.status(201).json({
-      message: 'Pedido cobrado.',
+      message: plan.complete ? 'Cuenta liquidada.' : 'Abono registrado.',
+      pago_id: paymentId, snapshot,
+      pedido: pedidoActualizado,
       pedido_id,
       monto: amount,
-      estado: 'PAGADO',
+      estado: plan.complete ? 'PAGADO' : 'PARCIAL',
       comprobante_tipo: comprobanteTipo,
       comprobante_numero: comprobanteNumero,
     });
   } catch (error) {
     if (conn) await conn.rollback();
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message, message: error.message });
   } finally {
     if (conn) conn.release();
   }
@@ -540,30 +641,38 @@ router.post('/movimientos', requirePermission('cash_movements'), async (req, res
   const allowed = ['INGRESO', 'RETIRO', 'GASTO'];
   const movementType = String(tipo || '').toUpperCase();
   if (!allowed.includes(movementType)) return res.status(400).json({ message: 'Tipo de movimiento invalido.' });
-  if (Number(monto || 0) <= 0) return res.status(400).json({ message: 'El monto debe ser mayor a cero.' });
   if (!String(motivo || '').trim()) return res.status(400).json({ message: 'El motivo es obligatorio.' });
 
+  let conn;
   try {
+    const amount = cashAmount(monto, { positive: true });
+    validateMethod(metodo);
     await ensureBillingTables();
-    const caja = await getOpenCaja(req.user.id);
-    if (!caja) return res.status(403).json({ message: 'Debes abrir caja antes de registrar movimientos.' });
-    const [result] = await pool.query(
+    conn = await pool.getConnection();
+    await beginAccountTransaction(conn);
+    const caja = await lockCashRegister(conn, req.body.caja_id);
+    if (!caja) { await conn.rollback(); return res.status(403).json({ message: 'Debes abrir caja antes de registrar movimientos.' }); }
+    const [result] = await conn.query(
       `INSERT INTO caja_movimientos (caja_id, trabajador_id, tipo, monto, metodo, motivo)
        VALUES (?, ?, ?, ?, ?, ?)`,
-      [caja.id, req.user.id, movementType, Number(monto), metodo, String(motivo).trim()]
+      [caja.id, req.user.id, movementType, amount, metodo, String(motivo).trim()]
     );
     await safeLogAudit({
+      conn,
       user: req.user,
       accion: 'caja.movimiento_registrado',
       entidad: 'caja_movimiento',
       entidadId: result.insertId,
       descripcion: `Movimiento de caja ${movementType}`,
-      metadata: { caja_id: caja.id, monto: Number(monto), metodo, motivo },
+      metadata: { caja_id: caja.id, monto: amount, metodo, motivo },
     });
+    await conn.commit();
+    emitRealtime(EVENTS.CASH_UPDATED, { action: 'movement', caja_id: caja.id });
     res.status(201).json({ message: 'Movimiento registrado.', id: result.insertId });
   } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    if (conn) await conn.rollback();
+    res.status(error.statusCode || 500).json({ message: error.message });
+  } finally { conn?.release(); }
 });
 
 router.post('/pagos/:id/anular', verifyRole('admin', 'supervisor', 'caja'), async (req, res) => {
@@ -575,13 +684,18 @@ router.post('/pagos/:id/anular', verifyRole('admin', 'supervisor', 'caja'), asyn
     await ensurePaymentFields();
     await ensureBillingTables();
     conn = await pool.getConnection();
-    await conn.beginTransaction();
+    await beginAccountTransaction(conn);
+    const caja = await lockCashRegister(conn);
     const [[pago]] = await conn.query('SELECT * FROM pagos WHERE id = ? FOR UPDATE', [req.params.id]);
     if (!pago) {
       await conn.rollback();
       return res.status(404).json({ message: 'Pago no encontrado.' });
     }
-    if (pago.estado !== 'ACTIVO') {
+    if (!caja || Number(caja.id) !== Number(pago.caja_id)) {
+      const error = new Error('El pago pertenece a una caja cerrada. Reabre ese cierre antes de modificarlo.');
+      error.statusCode = 409; throw error;
+    }
+    if ((pago.estado || 'ACTIVO') !== 'ACTIVO') {
       await conn.rollback();
       return res.status(409).json({ message: 'Este pago ya fue anulado o devuelto.' });
     }
@@ -611,6 +725,9 @@ router.post('/pagos/:id/anular', verifyRole('admin', 'supervisor', 'caja'), asyn
        WHERE id = ? AND estado = 'PAGADO'`,
       [pago.pedido_id]
     );
+    await refreshAccountState(conn, pago.pedido_id);
+    if (pago.division_id) await conn.query("UPDATE cuenta_divisiones SET estado = 'PENDIENTE' WHERE id = ?", [pago.division_id]);
+    else await conn.query('DELETE FROM cuenta_divisiones WHERE pedido_id = ?', [pago.pedido_id]);
     await safeLogAudit({
       conn,
       user: authorization.user,
@@ -630,6 +747,7 @@ router.post('/pagos/:id/anular', verifyRole('admin', 'supervisor', 'caja'), asyn
     await conn.commit();
     const pedido = await getPedidoCompleto(pago.pedido_id);
     emitRealtime(EVENTS.ORDER_UPDATED, { pedido, action: 'pago_anulado' });
+    emitRealtime(EVENTS.CASH_UPDATED, { action: 'payment_voided', caja_id: pago.caja_id });
     res.json({ message: 'Pago anulado.' });
   } catch (error) {
     if (conn) await conn.rollback();
@@ -648,13 +766,18 @@ router.post('/pagos/:id/devolver', verifyRole('admin', 'supervisor', 'caja'), as
     await ensurePaymentFields();
     await ensureBillingTables();
     conn = await pool.getConnection();
-    await conn.beginTransaction();
+    await beginAccountTransaction(conn);
+    const caja = await lockCashRegister(conn);
     const [[pago]] = await conn.query('SELECT * FROM pagos WHERE id = ? FOR UPDATE', [req.params.id]);
     if (!pago) {
       await conn.rollback();
       return res.status(404).json({ message: 'Pago no encontrado.' });
     }
-    if (pago.estado !== 'ACTIVO') {
+    if (!caja || Number(caja.id) !== Number(pago.caja_id)) {
+      const error = new Error('El pago pertenece a una caja cerrada. Reabre ese cierre antes de modificarlo.');
+      error.statusCode = 409; throw error;
+    }
+    if ((pago.estado || 'ACTIVO') !== 'ACTIVO') {
       await conn.rollback();
       return res.status(409).json({ message: 'Este pago ya fue anulado o devuelto.' });
     }
@@ -694,7 +817,11 @@ router.post('/pagos/:id/devolver', verifyRole('admin', 'supervisor', 'caja'), as
         ejecutado_por_nombre: req.user?.nombre,
       },
     });
+    if (pago.division_id) await conn.query("UPDATE cuenta_divisiones cd JOIN pedidos p ON p.id = cd.pedido_id SET cd.estado = 'PENDIENTE' WHERE cd.id = ? AND p.estado NOT IN ('PAGADO','CANCELADO')", [pago.division_id]);
+    const pedidoActualizado = await getPedidoCompleto(pago.pedido_id, conn);
     await conn.commit();
+    emitRealtime(EVENTS.ORDER_UPDATED, { pedido: pedidoActualizado, action: 'abono_devuelto' });
+    emitRealtime(EVENTS.CASH_UPDATED, { action: 'payment_refunded', caja_id: pago.caja_id });
     res.json({ message: 'Pago devuelto.' });
   } catch (error) {
     if (conn) await conn.rollback();
@@ -717,19 +844,23 @@ router.get('/cierres', verifyRole('admin', 'caja', 'supervisor'), async (req, re
     );
     res.json(rows);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message, message: error.message });
   }
 });
 
 router.put('/cierres/:id', requirePermission('cash_edit_closure'), async (req, res) => {
   const { monto_final, observacion = null } = req.body;
+  let conn;
   try {
     await ensureBillingTables();
-    const [[cierre]] = await pool.query("SELECT * FROM caja WHERE id = ? AND estado = 'Cerrada'", [req.params.id]);
-    if (!cierre) return res.status(404).json({ message: 'Cierre no encontrado.' });
-    const finalCash = Number(monto_final ?? cierre.monto_final ?? 0);
-    const diff = finalCash - Number(cierre.efectivo_esperado || 0);
-    await pool.query(
+    conn = await pool.getConnection();
+    await beginAccountTransaction(conn);
+    await lockCashRegister(conn);
+    const [[cierre]] = await conn.query("SELECT * FROM caja WHERE id = ? AND estado = 'Cerrada'", [req.params.id]);
+    if (!cierre) { await conn.rollback(); return res.status(404).json({ message: 'Cierre no encontrado.' }); }
+    const finalCash = cashAmount(monto_final ?? cierre.monto_final ?? 0);
+    const diff = Number((finalCash - Number(cierre.efectivo_esperado || 0)).toFixed(2));
+    await conn.query(
       `UPDATE caja
        SET monto_final = ?,
            diferencia_cierre = ?,
@@ -738,6 +869,7 @@ router.put('/cierres/:id', requirePermission('cash_edit_closure'), async (req, r
       [finalCash, diff, observacion ? String(observacion).trim() : null, req.params.id]
     );
     await safeLogAudit({
+      conn,
       user: req.user,
       accion: 'caja.cierre_editado',
       entidad: 'caja',
@@ -745,21 +877,28 @@ router.put('/cierres/:id', requirePermission('cash_edit_closure'), async (req, r
       descripcion: 'Cierre de caja editado por admin',
       metadata: { monto_final: finalCash, observacion },
     });
+    await conn.commit();
+    emitRealtime(EVENTS.CASH_UPDATED, { action: 'closure_edited' });
     res.json({ message: 'Cierre actualizado.' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    if (conn) await conn.rollback();
+    res.status(error.statusCode || 500).json({ error: error.message, message: error.message });
+  } finally { conn?.release(); }
 });
 
 router.post('/cierres/:id/reabrir', requirePermission('cash_reopen_closure'), async (req, res) => {
+  let conn;
   try {
     await ensureCajaFields();
     await ensureBillingTables();
-    const [[cierre]] = await pool.query("SELECT * FROM caja WHERE id = ? AND estado = 'Cerrada'", [req.params.id]);
-    if (!cierre) return res.status(404).json({ message: 'Cierre no encontrado.' });
-    const existing = await getOpenCaja(cierre.trabajador_id);
-    if (existing) return res.status(409).json({ message: 'Ya hay una caja abierta. Cierra la caja actual antes de reabrir un cierre.' });
-    await pool.query(
+    conn = await pool.getConnection();
+    await beginAccountTransaction(conn);
+    const currentCaja = await lockCashRegister(conn, req.body.caja_id);
+    const [[cierre]] = await conn.query("SELECT * FROM caja WHERE id = ? AND estado = 'Cerrada'", [req.params.id]);
+    if (!cierre) { await conn.rollback(); return res.status(404).json({ message: 'Cierre no encontrado.' }); }
+    const existing = currentCaja;
+    if (existing) { await conn.rollback(); return res.status(409).json({ message: 'Ya hay una caja abierta. Cierra la caja actual antes de reabrir un cierre.' }); }
+    await conn.query(
       `UPDATE caja
        SET estado = 'Abierta',
            fecha_cierre = NULL,
@@ -768,33 +907,41 @@ router.post('/cierres/:id/reabrir', requirePermission('cash_reopen_closure'), as
       [req.params.id]
     );
     await safeLogAudit({
+      conn,
       user: req.user,
       accion: 'caja.cierre_reabierto',
       entidad: 'caja',
       entidadId: Number(req.params.id),
       descripcion: 'Caja reabierta por admin',
     });
+    await conn.commit();
     emitRealtime(EVENTS.CASH_UPDATED, { action: 'reopened', caja_id: Number(req.params.id) });
     res.json({ message: 'Caja reabierta.' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    if (conn) await conn.rollback();
+    res.status(error.statusCode || 500).json({ message: error.message });
+  } finally { conn?.release(); }
 });
 
 router.post('/cerrar', requirePermission('cash_open_close'), async (req, res) => {
   const { monto_final, observacion = null } = req.body;
+  if (!Number.isSafeInteger(Number(req.body.caja_id)) || Number(req.body.caja_id) <= 0) return res.status(400).json({ message: 'Identifica la caja que deseas cerrar.' });
+  let conn;
   try {
     await ensureCajaFields();
     await ensurePaymentFields();
     await ensureBillingTables();
-    const caja = await getOpenCaja(req.user.id);
-    if (!caja) return res.status(404).json({ message: 'No hay caja abierta.' });
-    const totals = await cajaTotals(caja.id);
-    const expectedCash = Number(caja.monto_inicial || 0) + totals.efectivo + totals.ingresos - totals.retiros - totals.gastos - totals.devoluciones;
-    const finalCash = Number(monto_final ?? expectedCash);
-    const diff = finalCash - expectedCash;
+    conn = await pool.getConnection();
+    await beginAccountTransaction(conn);
+    const currentCaja = await lockCashRegister(conn, req.body.caja_id);
+    const caja = currentCaja;
+    if (!caja) { await conn.rollback(); return res.status(404).json({ message: 'No hay caja abierta.' }); }
+    const totals = await cajaTotals(caja.id, conn);
+    const expected = expectedCash(caja.monto_inicial, totals);
+    const finalCash = cashAmount(monto_final);
+    const diff = Number((finalCash - expected).toFixed(2));
 
-    await pool.query(
+    await conn.query(
       `UPDATE caja
        SET estado = 'Cerrada',
            monto_final = ?,
@@ -813,7 +960,7 @@ router.post('/cerrar', requirePermission('cash_open_close'), async (req, res) =>
       [
         finalCash,
         observacion ? String(observacion).trim() : null,
-        expectedCash,
+        expected,
         diff,
         totals.efectivo,
         totals.tarjeta,
@@ -826,6 +973,7 @@ router.post('/cerrar', requirePermission('cash_open_close'), async (req, res) =>
       ]
     );
     await safeLogAudit({
+      conn,
       user: req.user,
       accion: 'caja.cerrada',
       entidad: 'caja',
@@ -834,23 +982,25 @@ router.post('/cerrar', requirePermission('cash_open_close'), async (req, res) =>
       metadata: {
         monto_inicial: Number(caja.monto_inicial || 0),
         monto_final: finalCash,
-        efectivo_esperado: expectedCash,
+        efectivo_esperado: expected,
         diferencia: diff,
         observacion,
         totales: totals,
       },
     });
+    await conn.commit();
     emitRealtime(EVENTS.CASH_UPDATED, {
       action: 'closed',
       caja_id: caja.id,
       monto_final: finalCash,
-      efectivo_esperado: expectedCash,
+      efectivo_esperado: expected,
       diferencia_cierre: diff,
     });
-    res.json({ message: 'Caja cerrada.', resumen: { ...totals, efectivo_esperado: expectedCash, monto_final: finalCash, diferencia: diff } });
+    res.json({ message: 'Caja cerrada.', resumen: { ...totals, efectivo_esperado: expected, monto_final: finalCash, diferencia: diff } });
   } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    if (conn) await conn.rollback();
+    res.status(error.statusCode || 500).json({ message: error.message });
+  } finally { conn?.release(); }
 });
 
 export default router;

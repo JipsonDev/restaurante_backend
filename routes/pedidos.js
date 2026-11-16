@@ -1,12 +1,23 @@
+import { reserveRoundStock, consumeRoundReservation, releaseOrderReservations } from '../services/stockReservations.js';
+import { requireExpressPayment, historyDate } from '../services/expressPolicy.js';
+import { orderRequestKey, claimOrderRequest, finishOrderRequest } from '../services/orderRequests.js';
+import { requireUnpaidMutation } from '../services/paymentLedger.js';
 import express from 'express';
+import { migrateRounds, decorateAccount, refreshAccountState } from '../services/rounds.js';
+import { beginAccountTransaction, emitMergedAccounts, consolidateAccount, lockWholeAccount, mergeAccounts } from '../services/accounts.js';
+import { buildAccountSplit } from '../services/accountLogic.js';
+import { ensurePrintQueue, enqueuePrint } from '../services/printQueue.js';
+import { buildExtrasCatalog, normalizeOrderItem, orderTotal } from '../services/orderAmounts.js';
 import { pool } from '../db.js';
 import { verifyRole } from '../middleware/auth.js';
 import { emitRealtime, EVENTS } from '../realtime.js';
 import { sendPushToUser } from './notificaciones.js';
 import { emitTableFreed, emitTableOccupied, freeMesaIfNoActive, syncTableStates } from '../services/tableState.js';
-import { safeLogAudit } from '../services/audit.js';
+import { ensureAuditTable, safeLogAudit } from '../services/audit.js';
 import { getBusinessConfig } from '../services/businessConfig.js';
 import { normalizeRole } from '../services/permissions.js';
+import { loadOrderTracking, migrateRoundAttribution } from '../services/orderTracking.js';
+import { listDelayAlerts, claimDelayAlerts, migrateServiceAlerts } from '../services/serviceAlerts.js';
 
 const router = express.Router();
 
@@ -147,6 +158,16 @@ async function ensureSplitTables() {
   splitTablesReady = true;
 }
 
+export async function initializeOrderSchema() {
+  for (const column of Object.values(STATE_TS)) await addColumnIfMissing('pedidos', column, `ALTER TABLE pedidos ADD COLUMN ${column} DATETIME NULL`);
+  await addColumnIfMissing('pagos', 'estado', "ALTER TABLE pagos ADD COLUMN estado ENUM('ACTIVO','ANULADO','DEVUELTO') NOT NULL DEFAULT 'ACTIVO'");
+  await ensurePickupFields();
+  await ensureSplitTables();
+  await migrateRounds();
+  await migrateRoundAttribution(pool);
+  await migrateServiceAlerts(pool);
+}
+
 function normalizeEstado(estado) {
   return STATE_ALIASES[estado] || String(estado || '').toUpperCase();
 }
@@ -157,45 +178,38 @@ function isValidTransition(current, next) {
   return NEXT_ALLOWED[current]?.includes(next);
 }
 
-function parseMods(modsJson) {
-  if (!modsJson) return [];
-  try {
-    return JSON.parse(`[${modsJson}]`);
-  } catch {
-    return [];
-  }
-}
-
-async function hydrateOrders(rows) {
+async function hydrateOrders(rows, db = pool) {
   const orders = rows.map((p) => ({ ...p, estado: normalizeEstado(p.estado), items: [] }));
   const ids = orders.map((p) => p.id);
   if (!ids.length) return orders;
 
-  const [items] = await pool.query(
-    `SELECT dp.id, dp.pedido_id, dp.producto_id, dp.cantidad, dp.precio, dp.notas,
-            pr.nombre,
-            GROUP_CONCAT(
-              JSON_OBJECT(
-                'id', dpm.id,
-                'nombre', dpm.nombre,
-                'tipo', dpm.tipo,
-                'precio_extra', dpm.precio_extra
-              )
-            ) AS modificadores_json
+  const [items] = await db.query(
+    `SELECT dp.id, dp.pedido_id, dp.ronda_id, dp.producto_id, dp.cantidad, dp.precio, dp.notas, pr.nombre
      FROM detalle_pedidos dp
      LEFT JOIN productos pr ON dp.producto_id = pr.id
-     LEFT JOIN detalle_pedido_modificadores dpm ON dpm.detalle_pedido_id = dp.id
      WHERE dp.pedido_id IN (?)
-     GROUP BY dp.id
-     ORDER BY dp.id ASC`,
-    [ids]
+     ORDER BY dp.id ASC`, [ids]
   );
+  // GROUP_CONCAT could silently truncate long preparation instructions.
+  const [modifiers] = await db.query(
+    `SELECT dpm.id, dpm.detalle_pedido_id, dpm.nombre, dpm.tipo, dpm.precio_extra
+     FROM detalle_pedido_modificadores dpm
+     JOIN detalle_pedidos dp ON dp.id = dpm.detalle_pedido_id
+     WHERE dp.pedido_id IN (?) ORDER BY dpm.id`, [ids]
+  );
+  const modifiersByDetail = new Map();
+  for (const modifier of modifiers) {
+    const key = Number(modifier.detalle_pedido_id);
+    if (!modifiersByDetail.has(key)) modifiersByDetail.set(key, []);
+    modifiersByDetail.get(key).push(modifier);
+  }
 
   const byOrder = items.reduce((acc, item) => {
-    const mods = parseMods(item.modificadores_json).filter((m) => m.id !== null);
+    const mods = modifiersByDetail.get(Number(item.id)) || [];
     acc[item.pedido_id] = acc[item.pedido_id] || [];
     acc[item.pedido_id].push({
       id: item.id,
+      ronda_id: item.ronda_id,
       producto_id: item.producto_id,
       nombre: item.nombre,
       cantidad: Number(item.cantidad || 0),
@@ -206,12 +220,13 @@ async function hydrateOrders(rows) {
     return acc;
   }, {});
 
-  return orders.map((order) => ({ ...order, items: byOrder[order.id] || [] }));
+  const [rounds] = await db.query('SELECT * FROM pedido_rondas WHERE pedido_id IN (?) ORDER BY id', [ids]);
+  return orders.map((order) => decorateAccount(order, byOrder[order.id] || [], rounds.filter((round) => Number(round.pedido_id) === Number(order.id))));
 }
 
-export async function getPedidoCompleto(id) {
-  const [rows] = await pool.query(
-    `SELECT p.*,
+export async function getPedidoCompleto(id, db = pool) {
+  const [rows] = await db.query(
+    `SELECT p.*, (SELECT COALESCE(SUM(pg.monto),0) FROM pagos pg WHERE pg.pedido_id = p.id AND COALESCE(pg.estado,'ACTIVO') = 'ACTIVO') AS abonado,
             m.numero AS mesa_numero,
             t.nombre AS mesero_nombre
      FROM pedidos p
@@ -220,7 +235,7 @@ export async function getPedidoCompleto(id) {
      WHERE p.id = ?`,
     [id]
   );
-  return (await hydrateOrders(rows))[0] || null;
+  return (await hydrateOrders(rows, db))[0] || null;
 }
 
 function isPickupOrder(pedido) {
@@ -249,16 +264,17 @@ function pickupDetailLines(pedido) {
   return [pedido.cliente_dato ? `Dato: ${pedido.cliente_dato}` : 'Para recoger'].filter(Boolean);
 }
 
-async function notifyWaiterOrderReady(pedido, { manual = false } = {}) {
+async function notifyWaiterOrderReady(pedido, { manual = false, rondaId = null } = {}) {
   if (!pedido) return;
   const target = pedidoUbicacionLabel(pedido);
-  const title = manual ? `Cocina llama: ${target}` : `${target} listo`;
+  const title = manual ? `Cocina llama: ${target}` : `${target}: ronda lista`;
   const body = manual
     ? 'Cocina solicita que el mesero recoja o revise este pedido.'
-    : `Pedido #${pedido.id} listo para recoger.`;
+    : `Ronda #${rondaId || '-'} del pedido #${pedido.id} lista para recoger.`;
   const payload = {
     pedido,
     message: body,
+    ronda_id: rondaId,
     action: manual ? 'manual_ping' : 'order_ready',
   };
 
@@ -311,7 +327,14 @@ function kitchenItemRows(pedido, nameWidth = 24) {
     ].filter(Boolean).join(', ');
 
     const first = `${String(item.cantidad).padEnd(5)} ${cut(item.nombre, nameWidth).padEnd(nameWidth)} ${cut(observaciones, 10)}`;
-    const extra = observaciones.length > 10 ? [`      ${cut(observaciones.slice(10), 34)}`] : [];
+    const extra = [];
+    const name = String(item.nombre || '');
+    for (let offset = nameWidth; offset < name.length; offset += 34) {
+      extra.push(`      ${name.slice(offset, offset + 34)}`);
+    }
+    for (let offset = 10; offset < observaciones.length; offset += 34) {
+      extra.push(`      ${observaciones.slice(offset, offset + 34)}`);
+    }
     return [first, ...extra];
   });
 }
@@ -329,6 +352,7 @@ function buildKitchenTicket(pedido) {
     `COMANDA #${ticket}`.padEnd(24) + cut(target.toUpperCase(), 18),
     `Fecha: ${fecha}`.padEnd(24) + `Hora: ${hora}`,
     `Mesero: ${cut(pedido.mesero_nombre || '-', 30)}`,
+    pedido.ronda_id ? `RONDA #${pedido.ronda_id}` : '',
     line,
     'CANT. PRODUCTO                OBS.',
     line,
@@ -357,6 +381,7 @@ function buildPickupComanda(pedido) {
     `Cliente: ${cut(pedido.cliente_nombre || 'Consumidor final', 32)}`,
     `Mesero: ${cut(pedido.mesero_nombre || '-', 32)}`,
     ...customerLines,
+    pedido.ronda_id ? `RONDA #${pedido.ronda_id}` : '',
     line,
     'CANT. PRODUCTO                OBS.',
     line,
@@ -414,29 +439,46 @@ function buildPrecuenta(pedido, settings = {}) {
     }),
     line,
     ticketRow('Subtotal', moneyTicket(subtotal, symbol)),
-    ticketRow('Total a pagar', moneyTicket(total, symbol)),
+    ticketRow('Total de cuenta', moneyTicket(total, symbol)),
+    Number(pedido.abonado) > 0 ? ticketRow('Abonos', moneyTicket(pedido.abonado, symbol)) : '',
+    ticketRow('Saldo a pagar', moneyTicket(pedido.saldo_pendiente ?? total, symbol)),
     line,
     center('Ticket no fiscal'),
   ].filter(Boolean).join('\n');
 }
 
-async function getPedidoItemsForInventory(conn, pedidoId) {
+async function getPedidoItemsForInventory(conn, pedidoId, detailIds = null) {
   const [items] = await conn.query(
     `SELECT dp.id AS detalle_id, dp.producto_id, dp.cantidad,
             pr.nombre, pr.stock, pr.inventario_item_id
      FROM detalle_pedidos dp
      JOIN productos pr ON dp.producto_id = pr.id
-     WHERE dp.pedido_id = ?`,
-    [pedidoId]
+     WHERE dp.pedido_id = ? ${detailIds ? 'AND dp.id IN (?)' : ''}
+     ORDER BY dp.producto_id, dp.id`,
+    detailIds ? [pedidoId, detailIds] : [pedidoId]
   );
   return items;
 }
 
-async function deductInventoryForPedido(conn, pedidoId) {
-  const [[pedido]] = await conn.query('SELECT inventario_descontado FROM pedidos WHERE id = ? FOR UPDATE', [pedidoId]);
-  if (!pedido || Number(pedido.inventario_descontado) === 1) return;
+async function deductRoundInventory(conn, pedidoId, round) {
+  if (Number(round.inventario_descontado) === 1) return;
+  await reserveRoundStock(conn, round.id);
+  if (await consumeRoundReservation(conn, round.id, pedidoId)) {
+    await conn.query('UPDATE pedido_rondas SET inventario_descontado = 1 WHERE id = ?', [round.id]);
+    return;
+  }
+  const [details] = await conn.query('SELECT id FROM detalle_pedidos WHERE pedido_id = ? AND ronda_id = ? ORDER BY id', [pedidoId, round.id]);
+  if (details.length) await consumeInventoryItems(conn, await getPedidoItemsForInventory(conn, pedidoId, details.map((item) => item.id)), pedidoId);
+  await conn.query('UPDATE pedido_rondas SET inventario_descontado = 1 WHERE id = ?', [round.id]);
+}
 
-  const items = await getPedidoItemsForInventory(conn, pedidoId);
+async function deductInventoryForPedido(conn, pedidoId) {
+  const [rounds] = await conn.query("SELECT * FROM pedido_rondas WHERE pedido_id = ? AND estado <> 'CANCELADO' ORDER BY id FOR UPDATE", [pedidoId]);
+  for (const round of rounds) await deductRoundInventory(conn, pedidoId, round);
+  await conn.query('UPDATE pedidos SET inventario_descontado = 1 WHERE id = ?', [pedidoId]);
+}
+
+export async function consumeInventoryItems(conn, items, pedidoId) {
   for (const item of items) {
     const [recipes] = await conn.query(
       `SELECT r.inventario_item_id, r.cantidad, ii.nombre, ii.stock
@@ -472,27 +514,26 @@ async function deductInventoryForPedido(conn, pedidoId) {
         [item.inventario_item_id, Number(item.cantidad), `Consumo automatico pedido #${pedidoId} - ${item.nombre}`]
       );
     } else {
-      if (Number(item.stock) < Number(item.cantidad)) {
-        throw new Error(`Sin stock suficiente para ${item.nombre}. Disponible: ${item.stock}.`);
+      const [[product]] = await conn.query('SELECT stock FROM productos WHERE id = ? FOR UPDATE', [item.producto_id]);
+      if (!product || Number(product.stock) < Number(item.cantidad)) {
+        throw new Error(`Sin stock suficiente para ${item.nombre}. Disponible: ${product?.stock || 0}.`);
       }
       await conn.query(
         `UPDATE productos
-         SET stock = stock - ?,
-             disponible = CASE WHEN stock - ? <= 0 THEN 0 ELSE disponible END
+         SET disponible = CASE WHEN stock - ? <= 0 THEN 0 ELSE disponible END,
+             stock = stock - ?
          WHERE id = ?`,
         [item.cantidad, item.cantidad, item.producto_id]
       );
     }
   }
-
-  await conn.query('UPDATE pedidos SET inventario_descontado = 1 WHERE id = ?', [pedidoId]);
 }
 
 async function restoreInventoryForPedido(conn, pedidoId) {
-  const [[pedido]] = await conn.query('SELECT inventario_descontado FROM pedidos WHERE id = ? FOR UPDATE', [pedidoId]);
-  if (!pedido || Number(pedido.inventario_descontado) !== 1) return;
-
-  const items = await getPedidoItemsForInventory(conn, pedidoId);
+  await releaseOrderReservations(conn, pedidoId);
+  const [consumed] = await conn.query('SELECT dp.id FROM detalle_pedidos dp JOIN pedido_rondas r ON r.id = dp.ronda_id WHERE dp.pedido_id = ? AND r.inventario_descontado = 1', [pedidoId]);
+  if (!consumed.length) return;
+  const items = await getPedidoItemsForInventory(conn, pedidoId, consumed.map((item) => item.id));
   for (const item of items) {
     const [recipes] = await conn.query(
       `SELECT inventario_item_id, cantidad
@@ -526,6 +567,7 @@ async function restoreInventoryForPedido(conn, pedidoId) {
   }
 
   await conn.query('UPDATE pedidos SET inventario_descontado = 0 WHERE id = ?', [pedidoId]);
+  await conn.query('UPDATE pedido_rondas SET inventario_descontado = 0 WHERE pedido_id = ?', [pedidoId]);
 }
 
 export async function transitionPedido(conn, pedidoId, nextEstado, { allowShortcut = false } = {}) {
@@ -544,7 +586,9 @@ export async function transitionPedido(conn, pedidoId, nextEstado, { allowShortc
     await deductInventoryForPedido(conn, pedidoId);
   }
   if (next === 'CANCELADO') {
+    await requireUnpaidMutation(conn, [pedidoId]);
     await restoreInventoryForPedido(conn, pedidoId);
+    await conn.query("UPDATE pedido_rondas SET estado = 'CANCELADO' WHERE pedido_id = ?", [pedidoId]);
   }
 
   const tsColumn = STATE_TS[next];
@@ -572,22 +616,54 @@ router.get('/', async (req, res) => {
     await ensurePickupFields();
     await syncTableStates();
     const history = req.query.history === '1';
+    const kitchen = req.query.cocina === '1';
     const [rows] = await pool.query(
-      `SELECT p.*,
+      `SELECT p.*, (SELECT COALESCE(SUM(pg.monto),0) FROM pagos pg WHERE pg.pedido_id = p.id AND COALESCE(pg.estado,'ACTIVO') = 'ACTIVO') AS abonado,
               m.numero AS mesa_numero,
               t.nombre AS mesero_nombre
        FROM pedidos p
        LEFT JOIN mesas m ON p.mesa_id = m.id
        LEFT JOIN trabajadores t ON p.mesero_id = t.id
-       ${history ? '' : 'WHERE DATE(p.created_at) = CURDATE()'}
+       ${kitchen ? "WHERE p.estado NOT IN ('PAGADO', 'CANCELADO') OR EXISTS (SELECT 1 FROM pedido_rondas r WHERE r.pedido_id = p.id AND r.estado IN ('PENDIENTE', 'PREPARANDO', 'LISTO')) OR p.id IN (SELECT id FROM (SELECT id FROM pedidos ORDER BY created_at DESC LIMIT 160) recientes)" : history ? '' : "WHERE p.estado NOT IN ('PAGADO', 'CANCELADO') OR EXISTS (SELECT 1 FROM pedido_rondas r WHERE r.pedido_id = p.id AND r.estado IN ('PENDIENTE', 'PREPARANDO', 'LISTO')) OR DATE(p.created_at) = CURDATE()"}
        ORDER BY p.created_at DESC
-       LIMIT ${history ? 160 : 100}`
+       ${history && !kitchen ? 'LIMIT 160' : ''}`
     );
 
     res.json(await hydrateOrders(rows));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// Precios reales de los extras del catalogo (si la tabla aun no existe, vacio).
+async function loadExtrasCatalog(conn) {
+  try {
+    const [rows] = await conn.query('SELECT nombre, precio, tipo FROM extras WHERE activo = 1');
+    return buildExtrasCatalog(rows);
+  } catch (error) {
+    if (error.code === 'ER_NO_SUCH_TABLE') return new Map();
+    throw error;
+  }
+}
+
+router.post('/:id/imprimir-comanda', verifyRole('admin', 'cocina', 'mesero'), async (req, res) => {
+  try {
+    await ensurePrintQueue();
+    const pedido = await getPedidoCompleto(req.params.id);
+    if (!pedido) return res.status(404).json({ message: 'Pedido no encontrado.' });
+    const round = req.body.ronda_id ? pedido.rondas.find((r) => Number(r.id) === Number(req.body.ronda_id)) : null;
+    if (req.body.ronda_id && !round) return res.status(404).json({ message: 'Ronda no encontrada.' });
+    const printOrder = round ? { ...pedido, ronda_id: round.id, items: round.items, notas: round.notas, created_at: round.created_at } : pedido;
+    const settings = await getBusinessConfig();
+    const payload = {
+      pedido_id: pedido.id, mesa_id: pedido.mesa_id, modulo: 'cocina',
+      plantilla: 'ticket_cocina', texto: buildComanda(printOrder),
+      impresora: settings.impresora_cocina || null,
+    };
+    const job = await enqueuePrint(pool, payload);
+    emitRealtime(EVENTS.PRINT_COMANDA, { ...payload, job_id: job.id });
+    res.status(202).json({ job, message: 'Comanda en cola de impresion.' });
+  } catch (error) { res.status(503).json({ message: error.message }); }
 });
 
 router.get('/:id/comanda', async (req, res) => {
@@ -614,6 +690,44 @@ router.get('/:id/precuenta', async (req, res) => {
   }
 });
 
+// Completed Express orders are read by closure day, independently of active accounts.
+router.get('/express/historial', async (req, res) => {
+  let date, page;
+  try {
+    date = historyDate(req.query.fecha);
+    page = Number(req.query.page ?? 0);
+    if (!Number.isSafeInteger(page) || page < 0 || page > 10000) throw new Error('Pagina invalida.');
+  } catch (error) { return res.status(400).json({ message: error.message }); }
+  try {
+    const closedAt = 'GREATEST(COALESCE(p.pagado_at, p.created_at), COALESCE((SELECT MAX(r.entregado_at) FROM pedido_rondas r WHERE r.pedido_id = p.id), p.created_at))';
+    const [rows] = await pool.query(`SELECT p.*, t.nombre AS mesero_nombre, ${closedAt} AS cerrado_at
+      FROM pedidos p LEFT JOIN trabajadores t ON t.id = p.mesero_id
+      WHERE p.mesa_id IS NULL AND p.tipo IN ('Para llevar', 'Delivery') AND p.estado = 'PAGADO'
+      AND NOT EXISTS (SELECT 1 FROM pedido_rondas r WHERE r.pedido_id = p.id AND r.estado IN ('PENDIENTE', 'PREPARANDO', 'LISTO'))
+      AND ${closedAt} >= ? AND ${closedAt} < DATE_ADD(?, INTERVAL 1 DAY)
+      ORDER BY cerrado_at DESC, p.id DESC LIMIT 51 OFFSET ?`, [date, date, page * 50]);
+    res.json({ items: await hydrateOrders(rows.slice(0, 50)), hasMore: rows.length > 50, fecha: date, page });
+  } catch (error) { res.status(500).json({ message: 'No se pudo cargar el historial Express.' }); }
+});
+
+router.get('/alertas-demora', verifyRole('mesero','admin'), async (req,res) => {
+  try { res.json(await listDelayAlerts(pool, req.user.id)); }
+  catch { res.status(500).json({message:'No se pudieron consultar las demoras.'}); }
+});
+router.post('/alertas-demora/avisar', verifyRole('mesero','admin'), async (req,res) => {
+  try { res.json(await claimDelayAlerts(pool, req.user.id, req.body?.ids)); }
+  catch (error) { res.status(error.statusCode || 500).json({message:error.statusCode ? error.message : 'No se pudieron confirmar los avisos.'}); }
+});
+
+router.get('/:id/seguimiento', verifyRole('admin','mesero','caja'), async (req,res) => {
+  if (!/^[1-9]\d*$/.test(req.params.id) || !Number.isSafeInteger(Number(req.params.id))) return res.status(400).json({message:'Pedido inválido.'});
+  try {
+    const order=await getPedidoCompleto(Number(req.params.id));
+    if (!order) return res.status(404).json({message:'Pedido no encontrado.'});
+    res.json(await loadOrderTracking(pool,order));
+  } catch { res.status(500).json({message:'No se pudo consultar el seguimiento del pedido.'}); }
+});
+
 router.get('/:id', async (req, res) => {
   try {
     const pedido = await getPedidoCompleto(req.params.id);
@@ -627,11 +741,11 @@ router.get('/:id', async (req, res) => {
 router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
   await ensurePickupFields();
   const {
+    pedido_id = null,
     mesa_id = null,
     mesero_id,
     notas = null,
     items = [],
-    total: requestedTotal = null,
     tipo = 'Mesa',
     cliente_nombre = null,
     cliente_dato = null,
@@ -641,31 +755,61 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
   } = req.body;
   const normalizedTipo = tipo === 'Para llevar' || tipo === 'Delivery' ? tipo : 'Mesa';
   const isPickup = normalizedTipo !== 'Mesa';
-  const mesaId = mesa_id ? Number(mesa_id) : null;
+  const targetId = pedido_id == null ? null : Number(pedido_id);
+  if (targetId !== null && (!isPickup || !Number.isSafeInteger(targetId) || targetId <= 0)) return res.status(400).json({ message: 'Pedido express de destino invalido.' });
+  let requestKey;
+  try { requestKey = orderRequestKey(req.body.request_id); } catch (error) { return res.status(400).json({ message: error.message }); }
+  const mesaId = isPickup ? null : Number(mesa_id);
   const customerName = String(cliente_nombre || '').trim();
   const customerData = String(cliente_dato || '').trim();
   const deliveryPhone = String(delivery_telefono || '').trim();
   const deliveryAddress = String(delivery_direccion || '').trim();
   const deliveryReference = String(delivery_referencia || '').trim();
 
-  if ((!mesaId && !isPickup) || !items.length) {
+  if ((!isPickup && (!Number.isSafeInteger(mesaId) || mesaId <= 0)) || !Array.isArray(items) || !items.length) {
     return res.status(400).json({ message: 'Mesa e items son obligatorios.' });
   }
-  if (isPickup && !customerName) {
+  if (isPickup && !targetId && !customerName) {
     return res.status(400).json({ message: 'El nombre del cliente es obligatorio para pedidos express.' });
   }
 
-  const conn = await pool.getConnection();
+  let conn;
   try {
-    await conn.beginTransaction();
+    // Initialize configuration before opening the transaction (it can run DDL).
+    const businessConfig = await getBusinessConfig();
+    await ensureAuditTable();
+    await ensurePrintQueue();
+    conn = await pool.getConnection();
+    await beginAccountTransaction(conn);
+    const replay = await claimOrderRequest(conn, req.user.id, requestKey, req.body);
+    if (replay) { await conn.commit(); return res.status(200).json({ ...replay, replayed: true }); }
+    if (req.body.validar_precios && Number(req.body.servicio_esperado) !== Number(String(businessConfig.servicio_porcentaje).replace(',', '.'))) {
+      throw Object.assign(new Error('Cambio el porcentaje de servicio. Actualiza y revisa el total antes de enviar.'), { status: 409 });
+    }
+    let expressOrder = null;
+    if (targetId) {
+      const [[target]] = await conn.query('SELECT * FROM pedidos WHERE id = ? FOR UPDATE', [targetId]);
+      if (!target || target.mesa_id || !['Para llevar', 'Delivery'].includes(target.tipo)) throw Object.assign(new Error('El pedido Express ya no existe o cambio de destino.'), { status: 409 });
+      if (['PAGADO', 'CANCELADO'].includes(target.estado)) throw Object.assign(new Error('La cuenta Express ya esta cerrada.'), { status: 409 });
+      if (target.tipo !== normalizedTipo) throw Object.assign(new Error('El tipo de entrega cambio. Actualiza el pedido.'), { status: 409 });
+      await requireUnpaidMutation(conn, [target.id]);
+      expressOrder = target;
+    }
+    if (mesaId) {
+      const [[mesa]] = await conn.query('SELECT id, activo FROM mesas WHERE id = ? FOR UPDATE', [mesaId]);
+      if (!mesa || Number(mesa.activo) !== 1) {
+        await conn.rollback();
+        return res.status(409).json({ message: 'La mesa no existe o esta inactiva.' });
+      }
+    }
 
     const normalizedItems = [];
-    let total = 0;
+    const extrasCatalog = await loadExtrasCatalog(conn);
 
     for (const item of items) {
-      const productoId = Number(item.producto_id);
-      const cantidad = Number(item.cantidad || 0);
-      if (!productoId || cantidad <= 0) {
+      const productoId = Number(item?.producto_id);
+      const cantidad = Number(item?.cantidad);
+      if (!Number.isSafeInteger(productoId) || productoId <= 0 || !Number.isSafeInteger(cantidad) || cantidad <= 0) {
         await conn.rollback();
         return res.status(400).json({ message: 'Todos los items deben tener producto y cantidad valida.' });
       }
@@ -678,31 +822,23 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
         await conn.rollback();
         return res.status(409).json({ message: `Producto no disponible: ${product?.nombre || productoId}` });
       }
+      if (req.body.validar_precios && (!Number.isFinite(Number(item.precio)) || Math.round(Number(item.precio) * 100) !== Math.round(Number(product.precio) * 100))) {
+        throw Object.assign(new Error(`Cambio el precio de ${product.nombre}. Actualiza y revisa el total antes de enviar.`), { status: 409 });
+      }
 
-      const modificadores = Array.isArray(item.modificadores) ? item.modificadores.map((mod) => ({
-        nombre: String(mod.nombre || '').trim(),
-        tipo: ['EXTRA', 'EXCLUSION', 'TERMINO', 'NOTA'].includes(mod.tipo) ? mod.tipo : 'NOTA',
-        precio_extra: Number(mod.precio_extra || 0),
-      })).filter((mod) => mod.nombre) : [];
-
-      const extras = modificadores.reduce((sum, mod) => sum + Number(mod.precio_extra || 0), 0);
-      const precio = Number(item.precio ?? product.precio ?? 0);
-      total += (precio + extras) * cantidad;
-      normalizedItems.push({
-        producto_id: productoId,
-        cantidad,
-        precio,
-        notas: item.notas || null,
-        modificadores,
-      });
+      try {
+        normalizedItems.push(normalizeOrderItem(item, product, { extrasCatalog, strictPrices: Boolean(req.body.validar_precios) }));
+      } catch (error) {
+        await conn.rollback();
+        return res.status(error.status || 400).json({ message: error.message });
+      }
     }
 
-    const finalTotal = Number(requestedTotal || 0) >= total ? Number(requestedTotal) : total;
+    const finalTotal = orderTotal(normalizedItems, businessConfig.servicio_porcentaje);
     const [activeOrders] = await conn.query(
-      `SELECT id, total, notas, estado
+      `SELECT id, total, notas, estado, inventario_descontado
        FROM pedidos
        WHERE mesa_id = ?
-         AND DATE(created_at) = CURDATE()
          AND estado NOT IN ('PAGADO', 'CANCELADO')
          AND EXISTS (
            SELECT 1
@@ -710,12 +846,16 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
            WHERE dp.pedido_id = pedidos.id
              AND dp.cantidad > 0
          )
-       ORDER BY created_at DESC
-       LIMIT 1
+       ORDER BY id
        FOR UPDATE`,
       [mesaId]
     );
-    const activeOrder = !isPickup ? (activeOrders[0] || null) : null;
+    if (activeOrders.length) await requireUnpaidMutation(conn, activeOrders.map((order) => order.id));
+    let activeOrder = isPickup ? expressOrder : (activeOrders[0] || null);
+    if (!isPickup && activeOrder && activeOrders.length > 1) {
+      await mergeAccounts(conn, activeOrders, activeOrder.id);
+      activeOrder = { ...activeOrder, total: activeOrders.reduce((sum, order) => sum + Math.round(Number(order.total) * 100), 0) / 100, notas: activeOrders.map((order) => order.notas).filter(Boolean).join(' | ') };
+    }
     const isNewOrder = !activeOrder;
     let pedidoId;
 
@@ -726,7 +866,7 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
         `UPDATE pedidos
          SET total = ?,
              estado = 'PENDIENTE',
-             notas = ?
+             notas = ?, cuenta_solicitada_at = NULL
          WHERE id = ?`,
         [Number((Number(activeOrder.total || 0) + finalTotal).toFixed(2)), mergedNotes || null, pedidoId]
       );
@@ -739,7 +879,7 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
       pedidoId = result.insertId;
     }
 
-    await conn.query(
+    if (!targetId) await conn.query(
       `UPDATE pedidos
        SET cliente_nombre = ?,
            cliente_dato = ?,
@@ -757,13 +897,17 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
       ]
     );
 
+    const [roundResult] = await conn.query('INSERT INTO pedido_rondas (pedido_id, notas, creado_por, creado_por_nombre, pedido_origen_id) VALUES (?, ?, ?, ?, ?)', [pedidoId, notas, req.user.id, String(req.user.nombre || '').slice(0,120) || null, pedidoId]);
+    const rondaId = roundResult.insertId;
+    const newDetailIds = [];
     for (const item of normalizedItems) {
       const [detail] = await conn.query(
-        `INSERT INTO detalle_pedidos (pedido_id, producto_id, cantidad, precio, notas)
-         VALUES (?, ?, ?, ?, ?)`,
-        [pedidoId, item.producto_id, item.cantidad, item.precio, item.notas]
+        `INSERT INTO detalle_pedidos (pedido_id, producto_id, cantidad, precio, notas, ronda_id)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [pedidoId, item.producto_id, item.cantidad, item.precio, item.notas, rondaId]
       );
 
+      newDetailIds.push(detail.insertId);
       for (const mod of item.modificadores) {
         await conn.query(
           `INSERT INTO detalle_pedido_modificadores (detalle_pedido_id, nombre, tipo, precio_extra)
@@ -773,6 +917,9 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
       }
     }
 
+    await reserveRoundStock(conn, rondaId);
+    await conn.query('DELETE FROM cuenta_divisiones WHERE pedido_id = ?', [pedidoId]);
+    await refreshAccountState(conn, pedidoId);
     if (mesaId) await conn.query('UPDATE mesas SET estado = ? WHERE id = ?', ['Ocupada', mesaId]);
     await safeLogAudit({
       conn,
@@ -781,24 +928,14 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
       entidad: 'pedido',
       entidadId: pedidoId,
       descripcion: isNewOrder ? 'Pedido creado desde mesero' : 'Nueva ronda agregada a pedido activo',
-      metadata: { mesa_id: mesaId, tipo: normalizedTipo, cliente_nombre: customerName || null, items: normalizedItems.length, total: finalTotal },
+      metadata: { ronda_id:rondaId, actor_nombre:req.user.nombre || null, mesa_id: mesaId, tipo: normalizedTipo, cliente_nombre: customerName || null, items: normalizedItems.length, total: finalTotal },
     });
-    await conn.commit();
-
-    const pedido = await getPedidoCompleto(pedidoId);
-    const comanda = buildComanda(pedido);
-    const businessConfig = await getBusinessConfig();
-    emitRealtime(isNewOrder ? EVENTS.ORDER_CREATED : EVENTS.ORDER_UPDATED, {
-      pedido,
-      action: isNewOrder ? 'crear_pedido' : 'agregar_ronda',
+    const pedido = await getPedidoCompleto(pedidoId, conn);
+    const comanda = buildComanda({
+      ...pedido, ronda_id: rondaId, notas, created_at: new Date(),
+      items: pedido.items.filter((item) => newDetailIds.includes(Number(item.id))),
     });
-    if (mesaId) {
-      await emitTableOccupied(mesaId, {
-        pedido_id: pedidoId,
-        action: isNewOrder ? 'crear_pedido' : 'agregar_ronda',
-      });
-    }
-    emitRealtime(EVENTS.PRINT_COMANDA, {
+    const printPayload = {
       pedido_id: pedidoId,
       mesa_id: mesaId,
       tipo: isPickupOrder(pedido) ? (pedido.tipo === 'Delivery' ? 'delivery' : 'para-llevar') : 'cocina',
@@ -806,9 +943,9 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
       texto: comanda,
       impresora: businessConfig.impresora_cocina || null,
       modulo: 'cocina',
-    });
-
-    res.status(201).json({
+    };
+    const printJob = await enqueuePrint(conn, printPayload);
+    const response = {
       id: pedidoId,
       estado: 'PENDIENTE',
       message: isNewOrder
@@ -822,21 +959,87 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
       },
       cocina: {
         comanda_emitida: true,
+        impresion: printJob,
       },
+    };
+    await finishOrderRequest(conn, req.user.id, requestKey, response);
+    await conn.commit();
+
+    if (!isNewOrder) emitMergedAccounts(activeOrders, pedidoId);
+    emitRealtime(isNewOrder ? EVENTS.ORDER_CREATED : EVENTS.ORDER_UPDATED, {
+      pedido, action: isNewOrder ? 'crear_pedido' : 'agregar_ronda',
     });
+    emitRealtime(EVENTS.PRINT_COMANDA, { ...printPayload, job_id: printJob.id });
+    if (mesaId) await emitTableOccupied(mesaId, { pedido_id: pedidoId });
+
+    res.status(201).json(response);
   } catch (error) {
-    await conn.rollback();
-    res.status(500).json({ error: error.message });
+    if (conn) await conn.rollback();
+    res.status(error.status || error.statusCode || 500).json({ message: error.message, code: error.code });
   } finally {
-    conn.release();
+    conn?.release();
   }
+});
+
+router.put('/:id/rondas/:rondaId', verifyRole('admin', 'cocina', 'mesero'), async (req, res) => {
+  const next = normalizeEstado(req.body.estado);
+  const role = normalizeRole(req.user.rol);
+  if (!['PREPARANDO', 'LISTO', 'ENTREGADO'].includes(next) ||
+      (role === 'cocina' && next === 'ENTREGADO') || (role === 'mesero' && next !== 'ENTREGADO')) {
+    return res.status(403).json({ message: 'No tienes permiso para esta accion de la ronda.' });
+  }
+  const conn = await pool.getConnection();
+  try {
+    await beginAccountTransaction(conn);
+    const [[hint]] = await conn.query('SELECT mesa_id FROM pedidos WHERE id = ?', [req.params.id]);
+    if (hint?.mesa_id) await conn.query('SELECT id FROM mesas WHERE id = ? FOR UPDATE', [hint.mesa_id]);
+    const [[order]] = await conn.query('SELECT id, mesa_id, estado FROM pedidos WHERE id = ? FOR UPDATE', [req.params.id]);
+    if (!order || order.estado === 'CANCELADO') throw new Error('Cuenta no disponible.');
+    if (Number(order.mesa_id || 0) !== Number(hint?.mesa_id || 0)) throw new Error('La mesa cambio. Actualiza y reintenta.');
+    const [[round]] = await conn.query('SELECT * FROM pedido_rondas WHERE id = ? AND pedido_id = ? FOR UPDATE', [req.params.rondaId, order.id]);
+    if (!round) throw new Error('Ronda no encontrada.');
+    requireExpressPayment(order, next);
+    if (!isValidTransition(round.estado, next)) throw new Error(`Transicion invalida: ${round.estado} -> ${next}`);
+    if (next === 'PREPARANDO') await deductRoundInventory(conn, order.id, round);
+    const recordDelivery = next === 'ENTREGADO' && round.estado !== next;
+    await conn.query(`UPDATE pedido_rondas SET estado = ?, ${STATE_TS[next]} = COALESCE(${STATE_TS[next]}, NOW())${recordDelivery ? ', entregado_por = ?, entregado_por_nombre = ?' : ''} WHERE id = ?`, [next, ...(recordDelivery ? [req.user.id,String(req.user.nombre || '').slice(0,120) || null] : []), round.id]);
+    await refreshAccountState(conn, order.id);
+    const freed = next === 'ENTREGADO' ? await freeMesaIfNoActive(conn, order.mesa_id) : false;
+    await safeLogAudit({ conn, user: req.user, accion: 'ronda.estado_actualizado', entidad: 'ronda', entidadId: round.id,
+      metadata: { pedido_id: order.id, actor_nombre:req.user.nombre || null, before: round.estado, after: next } });
+    const pedido = await getPedidoCompleto(order.id, conn);
+    await conn.commit();
+    emitRealtime(EVENTS.ORDER_UPDATED, { pedido, action: 'ronda_actualizada' });
+    if (next === 'LISTO' && round.estado !== next) await notifyWaiterOrderReady(pedido, { rondaId: round.id }).catch((error) => console.warn('Aviso de ronda pendiente:', error.message));
+    if (freed) await emitTableFreed(order.mesa_id, { pedido_id: order.id });
+    res.json({ pedido, ronda_id: round.id, mesa_liberada: freed });
+  } catch (error) { await conn.rollback(); res.status(409).json({ message: error.message }); }
+  finally { conn.release(); }
 });
 
 router.put('/:id', verifyRole('admin', 'cocina', 'mesero', 'caja'), async (req, res) => {
   const next = normalizeEstado(req.body.estado);
+  if (req.body.expected_item_ids !== undefined && !Array.isArray(req.body.expected_item_ids)) {
+    return res.status(400).json({ message: 'Lista de productos invalida.' });
+  }
+  if (['PENDIENTE', 'PREPARANDO', 'LISTO', 'ENTREGADO'].includes(next)) {
+    return res.status(409).json({ message: 'Actualiza la ronda correspondiente, no la cuenta completa.' });
+  }
+  if (next === 'PAGADO') {
+    return res.status(403).json({ message: 'Registra el pago desde caja para cerrar la cuenta.' });
+  }
   const conn = await pool.getConnection();
   try {
-    await conn.beginTransaction();
+    await beginAccountTransaction(conn);
+    if (req.body.expected_item_ids) {
+      const [[currentOrder]] = await conn.query('SELECT id FROM pedidos WHERE id = ? FOR UPDATE', [req.params.id]);
+      if (!currentOrder) throw new Error('Pedido no encontrado.');
+      const [details] = await conn.query('SELECT id FROM detalle_pedidos WHERE pedido_id = ? ORDER BY id', [req.params.id]);
+      const expected = [...req.body.expected_item_ids].map(Number).sort((a, b) => a - b);
+      if (JSON.stringify(details.map((row) => Number(row.id)).sort((a, b) => a - b)) !== JSON.stringify(expected)) {
+        throw new Error('El pedido cambio: revisa los productos nuevos antes de continuar.');
+      }
+    }
     const transition = await transitionPedido(conn, req.params.id, next);
     await safeLogAudit({
       conn,
@@ -862,7 +1065,7 @@ router.put('/:id', verifyRole('admin', 'cocina', 'mesero', 'caja'), async (req, 
       message: `Pedido actualizado a ${transition.after}.`,
       transition,
       pedido,
-      mesa_liberada: ['PAGADO', 'CANCELADO'].includes(transition.after),
+      mesa_liberada: transition.table_freed,
     });
   } catch (error) {
     await conn.rollback();
@@ -889,7 +1092,8 @@ router.post('/:id/imprimir-precuenta', verifyRole('admin', 'mesero', 'caja'), as
   await ensurePickupFields();
   const conn = await pool.getConnection();
   try {
-    await conn.beginTransaction();
+    await beginAccountTransaction(conn);
+    const account = await consolidateAccount(conn, Number(req.params.id));
     const [[pedidoRow]] = await conn.query('SELECT mesa_id, estado FROM pedidos WHERE id = ? FOR UPDATE', [req.params.id]);
     if (!pedidoRow) {
       await conn.rollback();
@@ -897,8 +1101,9 @@ router.post('/:id/imprimir-precuenta', verifyRole('admin', 'mesero', 'caja'), as
     }
 
     const current = normalizeEstado(pedidoRow.estado);
-    if (['PENDIENTE', 'PREPARANDO', 'LISTO'].includes(current)) {
-      await transitionPedido(conn, req.params.id, 'ENTREGADO', { allowShortcut: true });
+    if (['PAGADO', 'CANCELADO'].includes(current)) {
+      await conn.rollback();
+      return res.status(409).json({ message: 'No puedes solicitar la cuenta de un pedido cerrado.' });
     }
     await conn.query(
       `UPDATE pedidos
@@ -919,6 +1124,7 @@ router.post('/:id/imprimir-precuenta', verifyRole('admin', 'mesero', 'caja'), as
       metadata: { before: current },
     });
     await conn.commit();
+    emitMergedAccounts(account.orders, Number(req.params.id));
 
     const businessConfig = await getBusinessConfig();
     const pedido = await getPedidoCompleto(req.params.id);
@@ -949,7 +1155,8 @@ router.post('/:id/solicitar-cobro', verifyRole('admin', 'mesero', 'caja'), async
   await ensurePickupFields();
   const conn = await pool.getConnection();
   try {
-    await conn.beginTransaction();
+    await beginAccountTransaction(conn);
+    const account = await consolidateAccount(conn, Number(req.params.id));
     const [[pedidoRow]] = await conn.query('SELECT mesa_id, estado FROM pedidos WHERE id = ? FOR UPDATE', [req.params.id]);
     if (!pedidoRow) {
       await conn.rollback();
@@ -957,8 +1164,9 @@ router.post('/:id/solicitar-cobro', verifyRole('admin', 'mesero', 'caja'), async
     }
 
     const current = normalizeEstado(pedidoRow.estado);
-    if (['PENDIENTE', 'PREPARANDO', 'LISTO'].includes(current)) {
-      await transitionPedido(conn, req.params.id, 'ENTREGADO', { allowShortcut: true });
+    if (['PAGADO', 'CANCELADO'].includes(current)) {
+      await conn.rollback();
+      return res.status(409).json({ message: 'No puedes solicitar la cuenta de un pedido cerrado.' });
     }
 
     await conn.query(
@@ -983,6 +1191,7 @@ router.post('/:id/solicitar-cobro', verifyRole('admin', 'mesero', 'caja'), async
     });
 
     await conn.commit();
+    emitMergedAccounts(account.orders, Number(req.params.id));
 
     const pedido = await getPedidoCompleto(req.params.id);
     emitRealtime(EVENTS.ORDER_UPDATED, { pedido, transition: { before: current, after: pedido.estado }, cobro_solicitado: true });
@@ -999,246 +1208,103 @@ router.post('/:id/solicitar-cobro', verifyRole('admin', 'mesero', 'caja'), async
 });
 
 router.post('/:id/transferir', verifyRole('admin', 'mesero'), async (req, res) => {
-  const { mesa_id } = req.body;
-  if (!mesa_id) return res.status(400).json({ message: 'mesa_id es obligatorio.' });
-
+  const mesaId = Number(req.body.mesa_id);
+  if (!Number.isSafeInteger(mesaId) || mesaId <= 0) return res.status(400).json({ message: 'Mesa destino invalida.' });
   const conn = await pool.getConnection();
   try {
-    await conn.beginTransaction();
-    const [[pedido]] = await conn.query('SELECT mesa_id, estado FROM pedidos WHERE id = ? FOR UPDATE', [req.params.id]);
-    if (!pedido) {
-      await conn.rollback();
-      return res.status(404).json({ message: 'Pedido no encontrado.' });
-    }
-    if (['PAGADO', 'CANCELADO'].includes(normalizeEstado(pedido.estado))) {
-      await conn.rollback();
-      return res.status(409).json({ message: 'No puedes transferir un pedido cerrado.' });
-    }
-
-    await conn.query('UPDATE pedidos SET mesa_id = ? WHERE id = ?', [mesa_id, req.params.id]);
-    await conn.query('UPDATE mesas SET estado = ? WHERE id = ?', ['Ocupada', mesa_id]);
-    const previousTableFreed = await freeMesaIfNoActive(conn, pedido.mesa_id);
-    await safeLogAudit({
-      conn,
-      user: req.user,
-      accion: 'pedido.transferido',
-      entidad: 'pedido',
-      entidadId: Number(req.params.id),
-      descripcion: 'Pedido transferido de mesa',
-      metadata: { mesa_anterior: pedido.mesa_id, mesa_nueva: mesa_id },
-    });
+    await beginAccountTransaction(conn);
+    const { seed, orders } = await lockWholeAccount(conn, Number(req.params.id), mesaId, { allowPaid: true });
+    if (!seed.mesa_id || Number(seed.mesa_id) === mesaId) throw new Error('Selecciona una mesa diferente.');
+    const sourceIds = orders.filter((order) => Number(order.mesa_id) === Number(seed.mesa_id)).map((order) => order.id);
+    // Paid food still awaiting delivery follows the table, but is never charged again.
+    const [paid] = await conn.query(`SELECT id FROM pedidos WHERE mesa_id = ? AND estado = 'PAGADO'
+      AND EXISTS (SELECT 1 FROM pedido_rondas r WHERE r.pedido_id = pedidos.id AND r.estado IN ('PENDIENTE', 'PREPARANDO', 'LISTO')) ORDER BY id FOR UPDATE`, [seed.mesa_id]);
+    const movedIds = [...new Set([...sourceIds, ...paid.map((order) => order.id)])];
+    await conn.query('UPDATE pedidos SET mesa_id = ? WHERE id IN (?)', [mesaId, movedIds]);
+    const openOrders = orders.filter((order) => !['PAGADO', 'CANCELADO'].includes(order.estado));
+    if (openOrders.length) await mergeAccounts(conn, openOrders, openOrders.some((order) => order.id === seed.id) ? seed.id : openOrders[0].id);
+    await conn.query("UPDATE mesas SET estado = 'Ocupada' WHERE id = ?", [mesaId]);
+    const sourceFreed = await freeMesaIfNoActive(conn, seed.mesa_id);
+    const pedido = await getPedidoCompleto(seed.id, conn);
+    const affected = [...new Set([...orders.map((order) => order.id), ...movedIds])];
+    const updated = await Promise.all(affected.map((id) => getPedidoCompleto(id, conn)));
+    await safeLogAudit({ conn, user: req.user, accion: 'cuenta.transferida', entidad: 'pedido', entidadId: seed.id,
+      metadata: { mesa_anterior: seed.mesa_id, mesa_nueva: mesaId, pedidos: movedIds } });
     await conn.commit();
-
-    const updated = await getPedidoCompleto(req.params.id);
-    emitRealtime(EVENTS.ORDER_UPDATED, { pedido: updated, action: 'transferir_mesa' });
-    await emitTableOccupied(mesa_id, { pedido_id: Number(req.params.id), action: 'transferir_mesa' });
-    if (previousTableFreed) {
-      await emitTableFreed(pedido.mesa_id, { pedido_id: Number(req.params.id), action: 'transferir_mesa' });
-    }
-    res.json({ message: 'Pedido transferido.', pedido: updated });
-  } catch (error) {
-    await conn.rollback();
-    res.status(500).json({ error: error.message });
-  } finally {
-    conn.release();
-  }
+    for (const order of updated) emitRealtime(EVENTS.ORDER_UPDATED, { pedido: order, action: 'cuenta_transferida' });
+    await emitTableOccupied(mesaId);
+    if (sourceFreed) await emitTableFreed(seed.mesa_id);
+    res.json({ pedido, pedidos: updated, message: 'Cuenta completa transferida.' });
+  } catch (error) { await conn.rollback(); res.status(409).json({ message: error.message }); }
+  finally { conn.release(); }
 });
 
 router.post('/unir-mesas', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
-  const { pedido_ids = [] } = req.body;
-  const ids = pedido_ids.map(Number).filter(Boolean);
-  if (ids.length < 2) return res.status(400).json({ message: 'Selecciona al menos dos pedidos para unir.' });
-
+  const ids = [...new Set((Array.isArray(req.body.pedido_ids) ? req.body.pedido_ids : []).map(Number))];
+  if (ids.length < 2 || ids.some((id) => !Number.isSafeInteger(id) || id <= 0)) return res.status(400).json({ message: 'Selecciona al menos dos cuentas validas.' });
   const conn = await pool.getConnection();
   try {
-    await conn.beginTransaction();
-    const targetId = ids[0];
-    const sourceIds = ids.slice(1);
-
-    const [orders] = await conn.query('SELECT id, mesa_id, estado, total FROM pedidos WHERE id IN (?) FOR UPDATE', [ids]);
-    if (orders.length !== ids.length) {
-      await conn.rollback();
-      return res.status(404).json({ message: 'Uno o mas pedidos no existen.' });
-    }
-    if (orders.some((p) => ['PAGADO', 'CANCELADO'].includes(normalizeEstado(p.estado)))) {
-      await conn.rollback();
-      return res.status(409).json({ message: 'No puedes unir pedidos cerrados.' });
-    }
-
-    await conn.query('UPDATE detalle_pedidos SET pedido_id = ? WHERE pedido_id IN (?)', [targetId, sourceIds]);
-    const mergedTotal = orders.reduce((sum, p) => sum + Number(p.total || 0), 0);
-    await conn.query('UPDATE pedidos SET total = ? WHERE id = ?', [mergedTotal, targetId]);
-    await conn.query(`UPDATE pedidos SET estado = 'CANCELADO', total = 0, cancelado_at = COALESCE(cancelado_at, NOW()) WHERE id IN (?)`, [sourceIds]);
-
-    const freedTableIds = [];
-    for (const order of orders.filter((p) => p.id !== targetId)) {
-      if (await freeMesaIfNoActive(conn, order.mesa_id)) {
-        freedTableIds.push(order.mesa_id);
-      }
-    }
-    await safeLogAudit({
-      conn,
-      user: req.user,
-      accion: 'pedido.unido',
-      entidad: 'pedido',
-      entidadId: targetId,
-      descripcion: 'Pedidos unidos',
-      metadata: { source_ids: sourceIds },
-    });
-
+    await beginAccountTransaction(conn);
+    const [hints] = await conn.query('SELECT id, mesa_id FROM pedidos WHERE id IN (?)', [ids]);
+    const tables = [...new Set(hints.map((order) => Number(order.mesa_id)).filter(Boolean))].sort((a,b) => a-b);
+    if (tables.length) await conn.query('SELECT id FROM mesas WHERE id IN (?) ORDER BY id FOR UPDATE', [tables]);
+    const [orders] = await conn.query("SELECT * FROM pedidos WHERE id IN (?) OR (mesa_id IN (?) AND estado NOT IN ('PAGADO', 'CANCELADO')) ORDER BY id FOR UPDATE", [ids, tables.length ? tables : [0]]);
+    if (ids.some((id) => !orders.some((order) => Number(order.id) === id))) throw new Error('Cuenta no encontrada.');
+    if (hints.some((hint) => Number(orders.find((order) => Number(order.id) === Number(hint.id))?.mesa_id) !== Number(hint.mesa_id))) throw new Error('Una cuenta cambio de mesa. Actualiza y reintenta.');
+    const target = orders.find((order) => Number(order.id) === ids[0]);
+    if (!target.mesa_id || orders.some((order) => !order.mesa_id)) throw new Error('Solo puedes unir cuentas de mesas.');
+    await mergeAccounts(conn, orders, target.id);
+    const updated = await Promise.all(orders.map((order) => getPedidoCompleto(order.id, conn)));
+    const freedTables = [];
+    for (const table of tables) if (await freeMesaIfNoActive(conn, table)) freedTables.push(table);
     await conn.commit();
-    const pedido = await getPedidoCompleto(targetId);
-    emitRealtime(EVENTS.ORDER_UPDATED, { pedido, action: 'unir_pedidos', source_ids: sourceIds });
-    for (const mesaId of freedTableIds) {
-      await emitTableFreed(mesaId, { pedido_id: targetId, action: 'unir_pedidos' });
-    }
-    res.json({ message: 'Pedidos unidos.', pedido });
-  } catch (error) {
-    await conn.rollback();
-    res.status(500).json({ error: error.message });
-  } finally {
-    conn.release();
-  }
+    for (const pedido of updated) emitRealtime(EVENTS.ORDER_UPDATED, { pedido, action: 'cuentas_unidas' });
+    for (const table of tables) await (freedTables.includes(table) ? emitTableFreed(table) : emitTableOccupied(table));
+    res.json({ pedido: updated.find((order) => Number(order.id) === Number(target.id)), message: 'Cuentas unidas conservando sus rondas.' });
+  } catch (error) { await conn.rollback(); res.status(409).json({ message: error.message }); }
+  finally { conn.release(); }
 });
 
-router.post('/:id/split/equal', async (req, res) => {
-  const partes = Math.max(2, Number(req.body.partes || 2));
-  try {
-    const pedido = await getPedidoCompleto(req.params.id);
-    if (!pedido) return res.status(404).json({ message: 'Pedido no encontrado.' });
-    const total = Number(pedido.total || 0);
-    const base = Math.floor((total / partes) * 100) / 100;
-    const divisions = Array.from({ length: partes }).map((_, index) => ({
-      nombre: `Parte ${index + 1}`,
-      monto: index === partes - 1 ? Number((total - base * (partes - 1)).toFixed(2)) : base,
-    }));
-    res.json({ pedido_id: pedido.id, total, partes, divisions });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-router.post('/:id/split/items', async (req, res) => {
-  const { groups = [] } = req.body;
-  try {
-    const pedido = await getPedidoCompleto(req.params.id);
-    if (!pedido) return res.status(404).json({ message: 'Pedido no encontrado.' });
-
-    const itemMap = new Map(pedido.items.map((item) => [Number(item.id), item]));
-    const divisions = groups.map((group, index) => {
-      const monto = (group.items || []).reduce((sum, itemRef) => {
-        const item = itemMap.get(Number(itemRef.detalle_pedido_id));
-        if (!item) return sum;
-        const qty = Number(itemRef.cantidad || item.cantidad || 0);
-        const extras = (item.modificadores || []).reduce((mSum, mod) => mSum + Number(mod.precio_extra || 0), 0);
-        return sum + (Number(item.precio || 0) + extras) * qty;
-      }, 0);
-      return { nombre: group.nombre || `Persona ${index + 1}`, monto: Number(monto.toFixed(2)), items: group.items || [] };
-    });
-    res.json({ pedido_id: pedido.id, divisions });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-router.post('/:id/split/request', verifyRole('admin', 'mesero'), async (req, res) => {
+async function splitAccount(req, res, preview = false, overrideMode = null) {
   const pedidoId = Number(req.params.id);
-  const mode = req.body.mode === 'items' ? 'items' : 'equal';
-  const partes = Math.max(2, Number(req.body.partes || 2));
-  const requestedDivisions = Array.isArray(req.body.divisions) ? req.body.divisions : [];
   const conn = await pool.getConnection();
-
   try {
-    await ensureSplitTables();
-    await conn.beginTransaction();
-    const [[pedidoRow]] = await conn.query(
-      `SELECT id, estado, total
-       FROM pedidos
-       WHERE id = ?
-       FOR UPDATE`,
-      [pedidoId]
-    );
-
-    if (!pedidoRow) {
-      await conn.rollback();
-      return res.status(404).json({ message: 'Pedido no encontrado.' });
-    }
-    if (['PAGADO', 'CANCELADO'].includes(normalizeEstado(pedidoRow.estado))) {
-      await conn.rollback();
-      return res.status(409).json({ message: 'No puedes dividir una cuenta cerrada.' });
-    }
-
-    await conn.query(
-      `DELETE FROM cuenta_divisiones
-       WHERE pedido_id = ?
-         AND estado = 'PENDIENTE'`,
-      [pedidoId]
-    );
-
-    let divisions = requestedDivisions
-      .map((division, index) => ({
-        nombre: String(division.nombre || `Parte ${index + 1}`).trim(),
-        monto: Number(division.monto || 0),
-        items: Array.isArray(division.items) ? division.items : [],
-      }))
-      .filter((division) => division.nombre && Number.isFinite(division.monto) && division.monto > 0);
-
-    if (!divisions.length) {
-      const total = Number(pedidoRow.total || 0);
-      const base = Math.floor((total / partes) * 100) / 100;
-      divisions = Array.from({ length: partes }).map((_, index) => ({
-        nombre: `Parte ${index + 1}`,
-        monto: index === partes - 1 ? Number((total - base * (partes - 1)).toFixed(2)) : base,
-        items: [],
-      }));
-    }
-
-    for (const division of divisions) {
-      const [created] = await conn.query(
-        `INSERT INTO cuenta_divisiones (pedido_id, nombre, monto, estado)
-         VALUES (?, ?, ?, 'PENDIENTE')`,
-        [pedidoId, division.nombre, Number(division.monto.toFixed(2))]
-      );
-
-      for (const item of division.items) {
-        const detailId = Number(item.detalle_pedido_id);
-        const cantidad = Number(item.cantidad || 1);
-        if (!detailId || cantidad <= 0) continue;
-        await conn.query(
-          `INSERT INTO cuenta_division_items (division_id, detalle_pedido_id, cantidad)
-           VALUES (?, ?, ?)`,
-          [created.insertId, detailId, cantidad]
-        );
+    await beginAccountTransaction(conn);
+    const account = await consolidateAccount(conn, pedidoId);
+    const pedido = await getPedidoCompleto(pedidoId, conn);
+    await requireUnpaidMutation(conn, [pedidoId]);
+    const mode = overrideMode || req.body.mode || 'equal';
+    const divisions = buildAccountSplit(pedido, { mode, partes: req.body.partes,
+      divisions: req.body.divisions || req.body.groups });
+    if (!preview) {
+      await conn.query('DELETE FROM cuenta_divisiones WHERE pedido_id = ?', [pedidoId]);
+      for (const division of divisions) {
+        const [created] = await conn.query("INSERT INTO cuenta_divisiones (pedido_id, nombre, monto, estado) VALUES (?, ?, ?, 'PENDIENTE')", [pedidoId, division.nombre, division.monto]);
+        for (const item of division.items) await conn.query('INSERT INTO cuenta_division_items (division_id, detalle_pedido_id, cantidad) VALUES (?, ?, ?)', [created.insertId, item.detalle_pedido_id, item.cantidad]);
       }
+      await safeLogAudit({ conn, user: req.user, accion: 'cuenta.dividida', entidad: 'pedido', entidadId: pedidoId,
+        metadata: { mode, partes: divisions.length } });
     }
-    await safeLogAudit({
-      conn,
-      user: req.user,
-      accion: 'pedido.division_solicitada',
-      entidad: 'pedido',
-      entidadId: pedidoId,
-      descripcion: 'Division de cuenta enviada a caja',
-      metadata: { mode, partes: divisions.length },
-    });
-
-    await conn.commit();
-    const pedido = await getPedidoCompleto(pedidoId);
+    // Preview rolls back consolidation; only the requested split changes stored data.
+    if (preview) await conn.rollback(); else await conn.commit();
     const payload = { pedido, pedido_id: pedidoId, mode, partes: divisions.length, divisions };
-    emitRealtime(EVENTS.SPLIT_REQUESTED, payload);
-    emitRealtime(EVENTS.ORDER_UPDATED, { pedido, action: 'split_requested', split: payload });
-    res.status(201).json({ message: 'Division enviada a caja.', ...payload });
-  } catch (error) {
-    await conn.rollback();
-    res.status(500).json({ error: error.message });
-  } finally {
-    conn.release();
-  }
-});
+    if (!preview) {
+      emitMergedAccounts(account.orders, pedidoId);
+      emitRealtime(EVENTS.SPLIT_REQUESTED, payload);
+      emitRealtime(EVENTS.ORDER_UPDATED, { pedido, action: 'split_requested' });
+    }
+    res.status(preview ? 200 : 201).json(payload);
+  } catch (error) { await conn.rollback(); res.status(409).json({ message: error.message }); }
+  finally { conn.release(); }
+}
+router.post('/:id/split/equal', verifyRole('admin', 'mesero', 'caja'), (req, res) => splitAccount(req, res, true, 'equal'));
+router.post('/:id/split/items', verifyRole('admin', 'mesero', 'caja'), (req, res) => splitAccount(req, res, true, 'items'));
+router.post('/:id/split/request', verifyRole('admin', 'mesero'), (req, res) => splitAccount(req, res));
 
 router.delete('/:id', verifyRole('admin', 'mesero'), async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    await conn.beginTransaction();
+    await beginAccountTransaction(conn);
     const [[pedido]] = await conn.query('SELECT * FROM pedidos WHERE id = ? FOR UPDATE', [req.params.id]);
     if (!pedido) {
       await conn.rollback();
@@ -1255,6 +1321,14 @@ router.delete('/:id', verifyRole('admin', 'mesero'), async (req, res) => {
       return res.status(403).json({ message: 'El mesero no puede borrar pedidos despues de enviarlos a cocina.' });
     }
 
+    const [reservations] = await conn.query('SELECT sr.ronda_id FROM stock_reservas sr JOIN pedido_rondas r ON r.id = sr.ronda_id WHERE r.pedido_id = ? LIMIT 1', [req.params.id]);
+    if (reservations.length) {
+      await conn.rollback();
+      return res.status(409).json({ message: 'Esta comanda tiene movimientos de inventario. Usa Cancelar para liberar sus reservas y conservar el historial.' });
+    }
+
+    const [paymentHistory] = await conn.query('SELECT id FROM pagos WHERE pedido_id = ? LIMIT 1', [req.params.id]);
+    if (paymentHistory.length) { await conn.rollback(); return res.status(409).json({ message: 'Esta cuenta tiene comprobantes. Conserva su historial; no puede eliminarse.' }); }
     await conn.query('DELETE FROM detalle_pedido_modificadores WHERE detalle_pedido_id IN (SELECT id FROM detalle_pedidos WHERE pedido_id = ?)', [req.params.id]);
     await conn.query('DELETE FROM detalle_pedidos WHERE pedido_id = ?', [req.params.id]);
     await conn.query('DELETE FROM pedidos WHERE id = ?', [req.params.id]);

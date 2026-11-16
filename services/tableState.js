@@ -2,8 +2,7 @@ import { pool } from '../db.js';
 import { emitRealtime, EVENTS } from '../realtime.js';
 
 const ACTIVE_ORDER_CONDITION = `
-  DATE(created_at) = CURDATE()
-  AND estado NOT IN ('PAGADO', 'CANCELADO')
+  (estado NOT IN ('PAGADO', 'CANCELADO') OR (estado = 'PAGADO' AND EXISTS (SELECT 1 FROM pedido_rondas r WHERE r.pedido_id = pedidos.id AND r.estado IN ('PENDIENTE', 'PREPARANDO', 'LISTO'))))
   AND EXISTS (
     SELECT 1
     FROM detalle_pedidos dp
@@ -73,8 +72,7 @@ export async function syncTableStates(conn = pool) {
          SELECT 1
          FROM pedidos p
          WHERE p.mesa_id = m.id
-           AND DATE(p.created_at) = CURDATE()
-           AND p.estado NOT IN ('PAGADO', 'CANCELADO')
+           AND (p.estado NOT IN ('PAGADO', 'CANCELADO') OR (p.estado = 'PAGADO' AND EXISTS (SELECT 1 FROM pedido_rondas r WHERE r.pedido_id = p.id AND r.estado IN ('PENDIENTE', 'PREPARANDO', 'LISTO'))))
            AND EXISTS (
              SELECT 1
              FROM detalle_pedidos dp
@@ -92,8 +90,7 @@ export async function syncTableStates(conn = pool) {
          SELECT 1
          FROM pedidos p
          WHERE p.mesa_id = m.id
-           AND DATE(p.created_at) = CURDATE()
-           AND p.estado NOT IN ('PAGADO', 'CANCELADO')
+           AND (p.estado NOT IN ('PAGADO', 'CANCELADO') OR (p.estado = 'PAGADO' AND EXISTS (SELECT 1 FROM pedido_rondas r WHERE r.pedido_id = p.id AND r.estado IN ('PENDIENTE', 'PREPARANDO', 'LISTO'))))
            AND EXISTS (
              SELECT 1
              FROM detalle_pedidos dp
@@ -110,8 +107,7 @@ export async function freeMesaIfNoActive(conn, mesaId) {
     `SELECT COUNT(*) AS activos
      FROM pedidos
      WHERE mesa_id = ?
-       AND DATE(created_at) = CURDATE()
-       AND estado NOT IN ('PAGADO', 'CANCELADO')
+       AND (estado NOT IN ('PAGADO', 'CANCELADO') OR (estado = 'PAGADO' AND EXISTS (SELECT 1 FROM pedido_rondas r WHERE r.pedido_id = pedidos.id AND r.estado IN ('PENDIENTE', 'PREPARANDO', 'LISTO'))))
        AND EXISTS (
          SELECT 1
          FROM detalle_pedidos dp

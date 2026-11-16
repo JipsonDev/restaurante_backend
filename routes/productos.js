@@ -1,3 +1,6 @@
+import { nonNegative, recipeItems, replaceRecipe } from '../services/adminValidation.js';
+import { catalogFlag, catalogName, validateCatalogLinks } from '../services/catalogValidation.js';
+import { sellableStockSQL } from '../services/stockReservations.js';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
@@ -36,13 +39,17 @@ router.get('/', async (req, res) => {
     const [rows] = await pool.query(
       `SELECT p.*,
               c.nombre AS categoria_nombre,
+              c.activo AS categoria_activa,
+              (SELECT COUNT(*) FROM recetas r WHERE r.producto_id = p.id AND r.activo = 1) AS receta_count,
               ii.nombre AS inventario_nombre,
               ii.stock AS inventario_stock,
+              ii.stock_reservado AS inventario_reservado,
+              ${sellableStockSQL} AS stock_disponible,
               ii.stock_minimo AS inventario_stock_minimo
        FROM productos p
        LEFT JOIN categorias c ON p.categoria_id = c.id
        LEFT JOIN inventario_items ii ON p.inventario_item_id = ii.id
-       ${includeInactive ? '' : 'WHERE p.disponible = 1'}
+       ${includeInactive ? '' : 'WHERE p.disponible = 1 AND COALESCE(c.activo, 1) = 1'}
        ORDER BY p.nombre ASC`
     );
     res.json(rows);
@@ -67,58 +74,36 @@ router.get('/categorias', async (req, res) => {
 });
 
 router.post('/categorias', verifyRole('admin'), async (req, res) => {
-  const { nombre, icono = null, activo = 1 } = req.body;
-  if (!nombre?.trim()) return res.status(400).json({ message: 'Nombre de categoria es obligatorio.' });
-
+  const conn = await pool.getConnection();
   try {
-    const [existing] = await pool.query(
-      'SELECT id FROM categorias WHERE LOWER(nombre) = LOWER(?) AND activo = 1',
-      [nombre.trim()]
-    );
-    if (existing.length) return res.status(409).json({ message: 'Ya existe una categoria activa con ese nombre.' });
-
-    const [result] = await pool.query(
-      'INSERT INTO categorias (nombre, icono, activo) VALUES (?, ?, ?)',
-      [nombre.trim(), icono || null, Number(activo) ? 1 : 0]
-    );
-    res.status(201).json({ id: result.insertId, nombre: nombre.trim(), icono, activo: Number(activo) ? 1 : 0 });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    const nombre = catalogName(req.body.nombre, 'Nombre de categoría');
+    const activo = catalogFlag(req.body.activo ?? 1);
+    await conn.beginTransaction();
+    const [existing] = await conn.query('SELECT id FROM categorias WHERE LOWER(TRIM(nombre)) = LOWER(?) AND activo = 1 FOR UPDATE', [nombre]);
+    if (activo && existing.length) { await conn.rollback(); return res.status(409).json({ message: 'Ya existe una categoría activa con ese nombre.' }); }
+    const [result] = await conn.query('INSERT INTO categorias (nombre, icono, activo) VALUES (?, ?, ?)', [nombre, String(req.body.icono || '').trim() || null, activo]);
+    await conn.commit();
+    res.status(201).json({ id: result.insertId, nombre, activo });
+  } catch (error) { await conn.rollback(); res.status(error.statusCode || 500).json({ message: error.message }); }
+  finally { conn.release(); }
 });
 
 router.put('/categorias/:id', verifyRole('admin'), async (req, res) => {
-  const { nombre, icono, activo } = req.body;
+  const conn = await pool.getConnection();
   try {
-    if (nombre !== undefined) {
-      if (!nombre.trim()) return res.status(400).json({ message: 'Nombre de categoria es obligatorio.' });
-      const [existing] = await pool.query(
-        'SELECT id FROM categorias WHERE LOWER(nombre) = LOWER(?) AND id <> ? AND activo = 1',
-        [nombre.trim(), req.params.id]
-      );
-      if (existing.length) return res.status(409).json({ message: 'Ya existe otra categoria activa con ese nombre.' });
-    }
-
-    await pool.query(
-      `UPDATE categorias
-       SET nombre = COALESCE(?, nombre),
-           icono = IF(? = 1, ?, icono),
-           activo = COALESCE(?, activo)
-       WHERE id = ?`,
-      [
-        nombre !== undefined ? nombre.trim() : null,
-        Object.prototype.hasOwnProperty.call(req.body, 'icono') ? 1 : 0,
-        icono || null,
-        activo !== undefined ? (Number(activo) ? 1 : 0) : null,
-        req.params.id,
-      ]
-    );
-    res.json({ message: 'Categoria actualizada.' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    await conn.beginTransaction();
+    const [[before]] = await conn.query('SELECT * FROM categorias WHERE id = ? FOR UPDATE', [req.params.id]);
+    if (!before) { await conn.rollback(); return res.status(404).json({ message: 'Categoría no encontrada.' }); }
+    const nombre = catalogName(req.body.nombre === undefined ? before.nombre : req.body.nombre, 'Nombre de categoría');
+    const activo = catalogFlag(req.body.activo === undefined ? before.activo : req.body.activo);
+    const [existing] = await conn.query('SELECT id FROM categorias WHERE LOWER(TRIM(nombre)) = LOWER(?) AND id <> ? AND activo = 1 FOR UPDATE', [nombre, req.params.id]);
+    if (activo && existing.length) { await conn.rollback(); return res.status(409).json({ message: 'Ya existe otra categoría activa con ese nombre.' }); }
+    await conn.query('UPDATE categorias SET nombre = ?, icono = ?, activo = ? WHERE id = ?', [nombre, Object.hasOwn(req.body, 'icono') ? String(req.body.icono || '').trim() || null : before.icono, activo, req.params.id]);
+    await conn.commit();
+    res.json({ message: 'Categoría actualizada.' });
+  } catch (error) { await conn.rollback(); res.status(error.statusCode || 500).json({ message: error.message }); }
+  finally { conn.release(); }
 });
-
 router.delete('/categorias/:id', verifyRole('admin'), async (req, res) => {
   try {
     const [[{ productos }]] = await pool.query(
@@ -151,6 +136,7 @@ router.get('/:id/receta', verifyRole('admin'), async (req, res) => {
       `SELECT r.id, r.producto_id, r.inventario_item_id, r.cantidad, r.unidad, r.activo,
               ii.nombre AS inventario_nombre,
               ii.stock AS inventario_stock,
+              ii.stock_reservado AS inventario_reservado,
               ii.unidad AS inventario_unidad
        FROM recetas r
        JOIN inventario_items ii ON r.inventario_item_id = ii.id
@@ -165,27 +151,20 @@ router.get('/:id/receta', verifyRole('admin'), async (req, res) => {
 });
 
 router.put('/:id/receta', verifyRole('admin'), async (req, res) => {
-  const { items = [] } = req.body;
   const conn = await pool.getConnection();
   try {
+    const items = recipeItems(req.body.items);
     await conn.beginTransaction();
-    await conn.query('DELETE FROM recetas WHERE producto_id = ?', [req.params.id]);
-    for (const item of items) {
-      if (!item.inventario_item_id || Number(item.cantidad || 0) <= 0) continue;
-      await conn.query(
-        `INSERT INTO recetas (producto_id, inventario_item_id, cantidad, unidad, activo)
-         VALUES (?, ?, ?, ?, 1)`,
-        [req.params.id, Number(item.inventario_item_id), Number(item.cantidad), item.unidad || null]
-      );
-    }
+    const [[product]] = await conn.query('SELECT id, inventario_item_id FROM productos WHERE id = ? FOR UPDATE', [req.params.id]);
+    if (!product) { await conn.rollback(); return res.status(404).json({ message: 'Producto no encontrado.' }); }
+    if (product.inventario_item_id && items.length) { await conn.rollback(); return res.status(400).json({ message: 'Cambia el vínculo directo por una receta desde el producto.' }); }
+    await replaceRecipe(conn, req.params.id, items);
     await conn.commit();
     res.json({ message: 'Receta actualizada.' });
   } catch (error) {
     await conn.rollback();
-    res.status(500).json({ error: error.message });
-  } finally {
-    conn.release();
-  }
+    res.status(error.statusCode || 500).json({ message: error.message });
+  } finally { conn.release(); }
 });
 
 router.get('/:id', async (req, res) => {
@@ -199,18 +178,27 @@ router.get('/:id', async (req, res) => {
 });
 
 router.post('/', verifyRole('admin'), async (req, res) => {
-  const { categoria_id = 1, inventario_item_id = null, nombre, descripcion, precio, stock = 0, imagen_url = null } = req.body;
+  const { categoria_id = 1, inventario_item_id = null, nombre, descripcion, precio, stock = 0, imagen_url = null, disponible = 1 } = req.body;
 
-  if (!nombre || precio === undefined || precio === null || precio === '') {
+  if (!String(nombre || '').trim() || precio === undefined || precio === null || precio === '') {
     return res.status(400).json({ message: 'Nombre y precio son obligatorios.' });
   }
 
+  const conn = await pool.getConnection();
   try {
-    const [result] = await pool.query(
-      `INSERT INTO productos (categoria_id, inventario_item_id, nombre, descripcion, precio, stock, imagen_url)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [categoria_id, inventario_item_id, nombre, descripcion || null, Number(precio), Number(stock), imagen_url]
+    nonNegative(precio, 'Precio'); nonNegative(stock, 'Stock', 0);
+    catalogFlag(disponible, 'Disponibilidad');
+    const cleanName = catalogName(nombre, 'Nombre del producto');
+    const receta = req.body.receta === undefined ? null : recipeItems(req.body.receta);
+    await conn.beginTransaction();
+    await validateCatalogLinks(conn, { categoryId: categoria_id, inventoryId: inventario_item_id, recipe: receta, published: Number(disponible) === 1 });
+    const [result] = await conn.query(
+      `INSERT INTO productos (categoria_id, inventario_item_id, nombre, descripcion, precio, stock, imagen_url, disponible)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [categoria_id, inventario_item_id, cleanName, descripcion || null, Number(precio), Number(stock), imagen_url, Number(disponible)]
     );
+    if (receta !== null) await replaceRecipe(conn, result.insertId, receta);
+    await conn.commit();
     await safeLogAudit({
       user: req.user,
       accion: 'producto.creado',
@@ -228,45 +216,68 @@ router.post('/', verifyRole('admin'), async (req, res) => {
       precio,
       stock,
       imagen_url,
-      disponible: 1,
+      disponible: Number(disponible),
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    await conn.rollback();
+    res.status(error.statusCode || 500).json({ message: error.message });
+  } finally { conn.release(); }
 });
 
 router.put('/:id', verifyRole('admin'), async (req, res) => {
   const { nombre, descripcion, precio, stock, imagen_url, disponible, categoria_id, inventario_item_id } = req.body;
   const hasInventarioLink = Object.prototype.hasOwnProperty.call(req.body, 'inventario_item_id');
+  if (stock != null && (!Number.isFinite(Number(stock)) || Number(stock) < 0 || !Number.isSafeInteger(Number(stock)))) return res.status(400).json({ message: 'Stock invalido: usa unidades enteras no negativas.' });
+  const conn = await pool.getConnection();
   try {
-    const [[before]] = await pool.query('SELECT * FROM productos WHERE id = ?', [req.params.id]);
-    if (!before) return res.status(404).json({ message: 'Producto no encontrado.' });
+    if (precio !== undefined) nonNegative(precio, 'Precio');
+    if (stock !== undefined) nonNegative(stock, 'Stock', 0);
+    if (disponible !== undefined) catalogFlag(disponible, 'Disponibilidad');
+    const cleanName = nombre !== undefined ? catalogName(nombre, 'Nombre del producto') : undefined;
+    const receta = req.body.receta === undefined ? null : recipeItems(req.body.receta);
+    await conn.beginTransaction();
+    const [[before]] = await conn.query('SELECT * FROM productos WHERE id = ? FOR UPDATE', [req.params.id]);
+    if (!before) { await conn.rollback(); return res.status(404).json({ message: 'Producto no encontrado.' }); }
 
-    await pool.query(
+    // Validate the resulting stock source, including partial requests.
+    const effectiveLink = hasInventarioLink ? inventario_item_id : before.inventario_item_id;
+    const [savedRecipe] = receta === null ? await conn.query('SELECT inventario_item_id FROM recetas WHERE producto_id = ? AND activo = 1', [req.params.id]) : [receta];
+    await validateCatalogLinks(conn, {
+      categoryId: categoria_id !== undefined ? categoria_id : Number(before.categoria_id) > 0 ? before.categoria_id : null,
+      inventoryId: hasInventarioLink || receta !== null || Number(disponible) === 1 ? effectiveLink : null,
+      recipe: hasInventarioLink || receta !== null ? savedRecipe : [],
+      published: Number(disponible ?? before.disponible) === 1,
+      requireCategory: categoria_id !== undefined,
+    });
+
+    const [updated] = await conn.query(
       `UPDATE productos
        SET nombre = COALESCE(?, nombre),
-           descripcion = COALESCE(?, descripcion),
+           descripcion = IF(? = 1, ?, descripcion),
            precio = COALESCE(?, precio),
            stock = COALESCE(?, stock),
-           imagen_url = COALESCE(?, imagen_url),
+           imagen_url = IF(? = 1, ?, imagen_url),
            disponible = COALESCE(?, disponible),
            categoria_id = COALESCE(?, categoria_id),
            inventario_item_id = IF(? = 1, ?, inventario_item_id)
-       WHERE id = ?`,
+       WHERE id = ? AND (? IS NULL OR ? >= stock_reservado OR ? >= stock)`,
       [
-        nombre ?? null,
-        descripcion ?? null,
+        cleanName ?? null,
+        Object.hasOwn(req.body, 'descripcion') ? 1 : 0, descripcion ?? null,
         precio ?? null,
         stock ?? null,
-        imagen_url ?? null,
+        Object.hasOwn(req.body, 'imagen_url') ? 1 : 0, imagen_url ?? null,
         disponible ?? null,
         categoria_id ?? null,
         hasInventarioLink ? 1 : 0,
         inventario_item_id ?? null,
-        req.params.id,
+        req.params.id, stock ?? null, stock ?? null, stock ?? null,
       ]
     );
-    const [[after]] = await pool.query('SELECT * FROM productos WHERE id = ?', [req.params.id]);
+    if (!updated.affectedRows) { await conn.rollback(); return res.status(409).json({ message: 'No puedes reducir el stock por debajo de las reservas de pedidos confirmados.' }); }
+    if (receta !== null) await replaceRecipe(conn, req.params.id, receta);
+    const [[after]] = await conn.query('SELECT * FROM productos WHERE id = ? FOR UPDATE', [req.params.id]);
+    await conn.commit();
     const priceChanged = precio !== undefined && Number(before.precio) !== Number(precio);
     await safeLogAudit({
       user: req.user,
@@ -295,8 +306,9 @@ router.put('/:id', verifyRole('admin'), async (req, res) => {
     });
     res.json({ message: 'Producto actualizado.' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    await conn.rollback();
+    res.status(error.statusCode || 500).json({ message: error.message });
+  } finally { conn.release(); }
 });
 
 router.delete('/:id', verifyRole('admin'), async (req, res) => {
@@ -317,6 +329,7 @@ router.delete('/:id', verifyRole('admin'), async (req, res) => {
       return res.status(409).json({ message: 'No se puede eliminar completamente: este producto ya existe en pedidos historicos.' });
     }
 
+    await conn.query('SELECT id FROM productos WHERE id = ? FOR UPDATE', [req.params.id]);
     await conn.query('DELETE FROM recetas WHERE producto_id = ?', [req.params.id]);
     const [result] = await conn.query('DELETE FROM productos WHERE id = ?', [req.params.id]);
     await safeLogAudit({
