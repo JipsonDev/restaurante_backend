@@ -190,18 +190,21 @@ async function upsertClienteFacturacion(conn, { documento, nombre, telefono = nu
 }
 
 export async function cajaTotals(cajaId, db = pool) {
+  // Cada columna de método se compara por separado contra el texto: pagos y pago_desglose pueden tener
+  // collations distintas en la base (p. ej. utf8mb4_bin vs utf8mb4_unicode_ci) y combinarlas con COALESCE
+  // antes de comparar provoca «Illegal mix of collations».
   const [[payments]] = await db.query(
     `SELECT
-        COALESCE(SUM(CASE WHEN metodo = 'Efectivo' THEN monto ELSE 0 END), 0) AS efectivo,
-        COALESCE(SUM(CASE WHEN metodo = 'Tarjeta' THEN monto ELSE 0 END), 0) AS tarjeta,
-        COALESCE(SUM(CASE WHEN metodo = 'Transferencia' THEN monto ELSE 0 END), 0) AS transferencia,
-        COALESCE(SUM(CASE WHEN metodo = 'QR' THEN monto ELSE 0 END), 0) AS qr,
-        COALESCE(SUM(CASE WHEN metodo = 'Vales' THEN monto ELSE 0 END), 0) AS vales,
-        COALESCE(SUM(CASE WHEN metodo = 'Otro' THEN monto ELSE 0 END), 0) AS otro,
+        COALESCE(SUM(CASE WHEN pd_metodo = 'Efectivo' OR (pd_metodo IS NULL AND pg_metodo = 'Efectivo') THEN monto ELSE 0 END), 0) AS efectivo,
+        COALESCE(SUM(CASE WHEN pd_metodo = 'Tarjeta' OR (pd_metodo IS NULL AND pg_metodo = 'Tarjeta') THEN monto ELSE 0 END), 0) AS tarjeta,
+        COALESCE(SUM(CASE WHEN pd_metodo = 'Transferencia' OR (pd_metodo IS NULL AND pg_metodo = 'Transferencia') THEN monto ELSE 0 END), 0) AS transferencia,
+        COALESCE(SUM(CASE WHEN pd_metodo = 'QR' OR (pd_metodo IS NULL AND pg_metodo = 'QR') THEN monto ELSE 0 END), 0) AS qr,
+        COALESCE(SUM(CASE WHEN pd_metodo = 'Vales' OR (pd_metodo IS NULL AND pg_metodo = 'Vales') THEN monto ELSE 0 END), 0) AS vales,
+        COALESCE(SUM(CASE WHEN pd_metodo = 'Otro' OR (pd_metodo IS NULL AND pg_metodo = 'Otro') THEN monto ELSE 0 END), 0) AS otro,
         COALESCE(SUM(monto), 0) AS total,
         COUNT(DISTINCT pago_id) AS pagos
      FROM (
-       SELECT pg.id AS pago_id, pg.caja_id, pg.estado, COALESCE(pd.metodo, pg.metodo) AS metodo,
+       SELECT pg.id AS pago_id, pg.caja_id, pg.estado, pd.metodo AS pd_metodo, pg.metodo AS pg_metodo,
          COALESCE(pd.monto, pg.monto) AS monto
        FROM pagos pg LEFT JOIN pago_desglose pd ON pd.pago_id = pg.id
      ) payment_parts
