@@ -93,7 +93,7 @@ router.get('/reports', verifyRole('admin', 'supervisor'), async (req, res) => {
         COALESCE(SUM(CASE WHEN COALESCE(pg.estado, 'ACTIVO') = 'ACTIVO' THEN pg.monto ELSE 0 END), 0) AS ventas,
         COUNT(DISTINCT CASE WHEN COALESCE(pg.estado, 'ACTIVO') = 'ACTIVO' THEN pg.pedido_id END) AS pedidos
         FROM pagos pg WHERE ${currentPaymentRange}
-        GROUP BY DATE(pg.created_at) ORDER BY DATE(pg.created_at)`),
+        GROUP BY fecha ORDER BY fecha`),
       pool.query(`SELECT COALESCE(NULLIF(TRIM(pg.metodo), ''), 'Otro') AS nombre,
         COALESCE(SUM(pg.monto), 0) AS total, COUNT(*) AS transacciones
         FROM pagos pg WHERE COALESCE(pg.estado, 'ACTIVO') = 'ACTIVO' AND ${currentPaymentRange}
@@ -116,7 +116,7 @@ router.get('/reports', verifyRole('admin', 'supervisor'), async (req, res) => {
       pool.query(`SELECT HOUR(pg.created_at) AS hora, COALESCE(SUM(pg.monto), 0) AS total,
         COUNT(DISTINCT pg.pedido_id) AS pedidos
         FROM pagos pg WHERE COALESCE(pg.estado, 'ACTIVO') = 'ACTIVO' AND ${currentPaymentRange}
-        GROUP BY HOUR(pg.created_at) ORDER BY HOUR(pg.created_at)`),
+        GROUP BY hora ORDER BY hora`),
       pool.query(`SELECT COUNT(*) AS cancelados FROM pedidos p
         WHERE UPPER(p.estado) = 'CANCELADO' AND ${currentOrderRange}`),
     ]);
