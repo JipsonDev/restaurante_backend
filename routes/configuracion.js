@@ -33,7 +33,7 @@ router.get('/', async (_req, res) => {
   try {
     res.json(await getBusinessConfig());
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ message: error.message, error: error.message });
   }
 });
 
@@ -55,6 +55,9 @@ router.put('/', verifyRole('admin'), async (req, res) => {
           moneda: before.moneda,
           impresora_caja: before.impresora_caja,
           impresora_cocina: before.impresora_cocina,
+          alertas_demora_activas: before.alertas_demora_activas,
+          alerta_espera_minutos: before.alerta_espera_minutos,
+          alerta_lista_minutos: before.alerta_lista_minutos,
         },
         despues: {
           nombre_restaurante: config.nombre_restaurante,
@@ -63,12 +66,15 @@ router.put('/', verifyRole('admin'), async (req, res) => {
           moneda: config.moneda,
           impresora_caja: config.impresora_caja,
           impresora_cocina: config.impresora_cocina,
+          alertas_demora_activas: config.alertas_demora_activas,
+          alerta_espera_minutos: config.alerta_espera_minutos,
+          alerta_lista_minutos: config.alerta_lista_minutos,
         },
       },
     });
     res.json(config);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ message: error.message, error: error.message });
   }
 });
 

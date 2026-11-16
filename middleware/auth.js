@@ -1,7 +1,11 @@
 import jwt from 'jsonwebtoken';
 import { normalizeRole } from '../services/permissions.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'morena_mia_secret_2024';
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET debe estar definido en las variables de entorno.');
+}
 
 export function verifyToken(req, res, next) {
   const header = req.headers.authorization;

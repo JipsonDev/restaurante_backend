@@ -1,3 +1,5 @@
+import { roomsForEvent } from './services/socketAuth.js';
+
 let io = null;
 
 export function setRealtimeServer(server) {
@@ -6,7 +8,8 @@ export function setRealtimeServer(server) {
 
 export function emitRealtime(event, payload = {}) {
   if (!io) return;
-  io.emit(event, {
+  // Nunca io.emit: solo salas autenticadas (ver services/socketAuth.js).
+  io.to(roomsForEvent(event)).emit(event, {
     ...payload,
     emitted_at: new Date().toISOString(),
   });

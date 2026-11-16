@@ -1,37 +1,39 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { rateLimit } from 'express-rate-limit';
 import { pool } from '../db.js';
-import { JWT_SECRET } from '../middleware/auth.js';
+import { JWT_SECRET, verifyRole, verifyToken } from '../middleware/auth.js';
 import { isValidRole, normalizeRole, VALID_ROLES } from '../services/permissions.js';
-import { ensurePinColumn, findUserByPin, hashUniquePin } from '../services/quickPin.js';
+import { clearPinFailures, ensurePinColumn, hashUniquePin, verifyQuickPin } from '../services/quickPin.js';
 
 const router = express.Router();
-const pinAttempts = new Map();
-const MAX_PIN_ATTEMPTS = 5;
-const PIN_LOCK_MS = 2 * 60 * 1000;
+// Count failures before credential checks; login and PIN setup share a budget.
+const attemptLimit = limit => rateLimit({
+  windowMs: 2 * 60 * 1000,
+  limit,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  message: { message: 'Demasiados intentos. Espera 2 minutos e intenta de nuevo.' },
+});
+const passwordAttempts = attemptLimit(10);
+const pinAttempts = attemptLimit(5);
+router.use((_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+
+const validCredentials = (correo, password) => typeof correo === 'string'
+  && correo.trim().length > 0 && correo.length <= 254
+  && typeof password === 'string' && password.length > 0 && password.length <= 1024;
+const validPin = pin => typeof pin === 'string' && /^\d{4}$/.test(pin);
 
 const mysqlErrorDetails = (error) =>
   error.message || error.code || error.sqlMessage || JSON.stringify(error);
 
-const loginErrorMessage = (error) => {
-  if (error.code === 'ECONNREFUSED') {
-    return 'No se pudo conectar a MySQL. Revisa que MySQL este iniciado y que DB_HOST/DB_PORT sean correctos.';
-  }
-  if (error.code === 'ER_BAD_DB_ERROR') {
-    return 'La base de datos configurada no existe. Revisa DB_NAME en restaurante-backend/.env.';
-  }
-  if (error.code === 'ER_NO_SUCH_TABLE') {
-    return 'No existe la tabla trabajadores. Importa o crea la base de datos antes de iniciar sesion.';
-  }
-  if (error.code === 'ER_BAD_FIELD_ERROR') {
-    return 'La tabla trabajadores no tiene las columnas esperadas para login.';
-  }
-  if (error.code === 'ER_ACCESS_DENIED_ERROR') {
-    return 'MySQL rechazo las credenciales. Revisa DB_USER y DB_PASSWORD en restaurante-backend/.env.';
-  }
-  return 'Error interno del servidor.';
-};
+// Diagnostics stay on the server instead of exposing database configuration.
+const loginErrorMessage = () => 'No se pudo iniciar sesión. Inténtalo de nuevo más tarde.';
 
 function signSession(user) {
   const payload = { id: user.id, nombre: user.nombre, correo: user.correo, rol: normalizeRole(user.rol) };
@@ -39,44 +41,22 @@ function signSession(user) {
   return { token, user: payload };
 }
 
-function pinAttemptKey(req) {
-  return req.ip || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
-}
-
-function isPinLocked(req) {
-  const item = pinAttempts.get(pinAttemptKey(req));
-  return item?.lockedUntil && item.lockedUntil > Date.now();
-}
-
-function registerPinFailure(req) {
-  const key = pinAttemptKey(req);
-  const current = pinAttempts.get(key) || { count: 0, lockedUntil: 0 };
-  const count = current.lockedUntil > Date.now() ? current.count : current.count + 1;
-  pinAttempts.set(key, {
-    count,
-    lockedUntil: count >= MAX_PIN_ATTEMPTS ? Date.now() + PIN_LOCK_MS : 0,
-  });
-}
-
-function clearPinFailures(req) {
-  pinAttempts.delete(pinAttemptKey(req));
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/login
 // Body: { correo, password }
 // ─────────────────────────────────────────────────────────────────────────────
-router.post('/login', async (req, res) => {
-  const { correo, password } = req.body;
+router.post('/login', passwordAttempts, async (req, res) => {
+  const { correo, password } = req.body || {};
 
-  if (!correo || !password) {
+  if (!validCredentials(correo, password)) {
     return res.status(400).json({ message: 'Correo y contraseña son obligatorios.' });
   }
 
   try {
     // 1. Buscar usuario activo por correo
+    await ensurePinColumn();
     const [rows] = await pool.query(
-      `SELECT id, nombre, correo, password_hash, rol, pin_hash
+      `SELECT id, nombre, correo, password_hash, rol, pin_hash, pin_fallos, pin_bloqueado_hasta
        FROM trabajadores
        WHERE correo = ? AND activo = 1
        LIMIT 1`,
@@ -103,6 +83,7 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    if (user.pin_fallos || user.pin_bloqueado_hasta) await clearPinFailures(user.id);
     return res.json(signSession(user));
 
   } catch (error) {
@@ -111,38 +92,40 @@ router.post('/login', async (req, res) => {
   }
 });
 
-router.post('/login-pin', async (req, res) => {
-  const { pin } = req.body;
+router.post('/login-pin', pinAttempts, async (req, res) => {
+  const { correo, pin } = req.body || {};
 
-  if (!pin) {
-    return res.status(400).json({ message: 'PIN es obligatorio.' });
+  if (!validPin(pin)) {
+    return res.status(400).json({ message: 'El PIN debe tener exactamente 4 dígitos.' });
   }
-  if (isPinLocked(req)) {
-    return res.status(429).json({ message: 'Demasiados intentos. Espera 2 minutos e intenta de nuevo.' });
+  if (typeof correo !== 'string' || !correo.trim() || correo.length > 254) {
+    return res.status(400).json({ message: 'Elige tu usuario antes de escribir el PIN.' });
   }
 
   try {
-    const user = await findUserByPin({
+    // El PIN se valida contra UNA cuenta concreta (correo) y esa cuenta se
+    // bloquea tras varios fallos: ya no se puede adivinar "el PIN de cualquiera".
+    const user = await verifyQuickPin({
+      correo,
       pin,
       roles: ['admin', 'supervisor', 'mesero', 'cocina', 'caja'],
     });
     if (!user) {
-      registerPinFailure(req);
-      return res.status(401).json({ message: 'PIN incorrecto.' });
+      return res.status(401).json({ message: 'Usuario o PIN incorrecto.' });
     }
 
-    clearPinFailures(req);
     return res.json(signSession(user));
   } catch (error) {
+    if (error.retryAfterSeconds) res.setHeader('Retry-After', String(error.retryAfterSeconds));
     console.error('Error en login-pin:', mysqlErrorDetails(error));
     return res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : loginErrorMessage(error) });
   }
 });
 
-router.post('/setup-pin', async (req, res) => {
-  const { correo, password, pin } = req.body;
+router.post('/setup-pin', passwordAttempts, async (req, res) => {
+  const { correo, password, pin } = req.body || {};
 
-  if (!correo || !password || !pin) {
+  if (!validCredentials(correo, password) || !validPin(pin)) {
     return res.status(400).json({ message: 'Correo, contrasena y PIN son obligatorios.' });
   }
 
@@ -176,11 +159,13 @@ router.post('/setup-pin', async (req, res) => {
 // POST /api/auth/register  (solo admin puede crear usuarios)
 // Body: { nombre, correo, password, rol }
 // ─────────────────────────────────────────────────────────────────────────────
-router.post('/register', async (req, res) => {
-  const { nombre, correo, password, rol = 'mesero', pin = null } = req.body;
+// User creation is an administrative operation even through the auth router.
+router.post('/register', verifyToken, verifyRole('admin'), async (req, res) => {
+  const { nombre, correo, password, rol = 'mesero', pin = null } = req.body || {};
   const nextRole = normalizeRole(rol);
 
-  if (!nombre || !correo || !password) {
+  if (typeof nombre !== 'string' || !nombre.trim() || nombre.length > 150
+    || !validCredentials(correo, password) || (pin !== null && !validPin(pin))) {
     return res.status(400).json({ message: 'Nombre, correo y contraseña son obligatorios.' });
   }
 

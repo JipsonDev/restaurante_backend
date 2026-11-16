@@ -1,3 +1,4 @@
+import { nonNegative } from '../services/adminValidation.js';
 import express from 'express';
 import { pool } from '../db.js';
 import { verifyRole } from '../middleware/auth.js';
@@ -58,7 +59,7 @@ router.get('/', async (req, res) => {
     );
     res.json(rows);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -72,6 +73,7 @@ router.post('/', verifyRole('admin'), async (req, res) => {
   if (!validTypes.includes(tipo)) return res.status(400).json({ message: `Tipo invalido. Validos: ${validTypes.join(', ')}` });
 
   try {
+    nonNegative(precio, 'Precio');
     const [result] = await pool.query(
       `INSERT INTO extras (nombre, precio, tipo, categoria, activo)
        VALUES (?, ?, ?, ?, ?)`,
@@ -79,7 +81,7 @@ router.post('/', verifyRole('admin'), async (req, res) => {
     );
     res.status(201).json({ id: result.insertId, message: 'Extra creado.' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -89,10 +91,12 @@ router.put('/:id', verifyRole('admin'), async (req, res) => {
   } = req.body;
   const validTypes = ['EXTRA', 'EXCLUSION', 'TERMINO', 'NOTA'];
 
-  if (tipo && !validTypes.includes(tipo)) return res.status(400).json({ message: `Tipo invalido. Validos: ${validTypes.join(', ')}` });
+  if (tipo !== undefined && !validTypes.includes(tipo)) return res.status(400).json({ message: `Tipo invalido. Validos: ${validTypes.join(', ')}` });
 
   try {
-    await pool.query(
+    if (precio !== undefined) nonNegative(precio, 'Precio');
+    if (nombre !== undefined && !String(nombre || '').trim()) return res.status(400).json({ message: 'Nombre obligatorio.' });
+    const [result] = await pool.query(
       `UPDATE extras
        SET nombre = COALESCE(?, nombre),
            precio = COALESCE(?, precio),
@@ -110,9 +114,10 @@ router.put('/:id', verifyRole('admin'), async (req, res) => {
         req.params.id,
       ]
     );
+    if (!result.affectedRows) return res.status(404).json({ message: 'Extra no encontrado.' });
     res.json({ message: 'Extra actualizado.' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -122,7 +127,7 @@ router.delete('/:id', verifyRole('admin'), async (req, res) => {
     if (result.affectedRows === 0) return res.status(404).json({ message: 'Extra no encontrado.' });
     res.json({ message: 'Extra eliminado permanentemente.' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 

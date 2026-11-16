@@ -1,61 +1,57 @@
-import fs from 'fs';
-import path from 'path';
-import { spawn } from 'child_process';
+import path from 'node:path';
 import { io } from 'socket.io-client';
+import { randomUUID } from 'node:crypto';
 import dotenv from 'dotenv';
+import { createPrintRunner, createPrintWorker, parsePrintArgs } from '../services/printRunner.js';
+import { listSystemPrinters } from '../services/printers.js';
 
 dotenv.config();
-
-const serverUrl = process.env.PRINT_SERVER_URL || `http://localhost:${process.env.PORT || 3000}`;
+const serverUrl = (process.env.PRINT_SERVER_URL || `http://localhost:${process.env.PORT || 3000}`).replace(/\/api\/?$/, '').replace(/\/$/, '');
 const outputDir = path.resolve(process.cwd(), process.env.PRINT_OUTPUT_DIR || 'print-jobs');
-const printCommand = process.env.PRINT_COMMAND || '';
-const printArgs = (process.env.PRINT_ARGS || '').split(' ').filter(Boolean);
+const mode = process.env.PRINT_MODE || 'system';
+const modulo = process.env.PRINT_MODULE || 'cocina';
+const token = process.env.PRINT_AGENT_TOKEN || '';
+const printer = process.env.PRINT_PRINTER || '';
+const args = parsePrintArgs(process.env.PRINT_ARGS || '');
+if (!['cocina', 'caja'].includes(modulo)) throw new Error('PRINT_MODULE debe ser cocina o caja.');
 
-fs.mkdirSync(outputDir, { recursive: true });
-
-function safeName(type, payload) {
-  const suffix = payload.pedido_id || Date.now();
-  const template = String(payload.plantilla || payload.tipo || type)
-    .replace(/[^a-z0-9_-]/gi, '_')
-    .toLowerCase();
-  return `${template}-${suffix}-${Date.now()}.txt`;
-}
-
-function runPrintCommand(file, printer = '') {
-  if (!printCommand) {
-    console.log(`[print-agent] Ticket guardado: ${file}${printer ? ` | impresora sugerida: ${printer}` : ''}`);
-    return;
+if (process.argv.includes('--check')) {
+  console.log(JSON.stringify({ serverUrl, mode, modulo, printer: printer || '(configuracion del negocio)',
+    tokenConfigured: Boolean(token), printers: await listSystemPrinters() }, null, 2));
+} else {
+  if (!token) throw new Error('Configura PRINT_AGENT_TOKEN con el mismo secreto del servidor.');
+  const run = createPrintRunner({ outputDir, mode, printer, command: process.env.PRINT_COMMAND || '', args });
+  const api = async (route, body) => {
+    const response = await fetch(`${serverUrl}/api/impresiones${route}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-print-token': token },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(15000),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.message || `HTTP ${response.status}`);
+    return data;
+  };
+  const tick = createPrintWorker({ api, run, outputDir, modulo });
+  const poll = async () => {
+    try {
+      const result = await tick();
+      if (result) console.log(`[print-agent] ${result.estado}${result.error ? ': ' + result.error : ''}`);
+    } catch (error) { console.error(`[print-agent] ${error.message}`); }
+  };
+  console.log(`[print-agent] ${modulo}, modo ${mode}. ${mode === 'simulate' ? 'SIMULACION: no imprime papel.' : 'ENVIADO = aceptado por el controlador.'}`);
+  await poll();
+  const timer = setInterval(poll, 2000);
+  // Existing precuenta producers still use realtime; comandas use only the durable queue.
+  const socket = io(serverUrl, { reconnection: true, auth: { printToken: token } });
+  let legacyQueue = Promise.resolve();
+  if (modulo === 'caja') {
+    for (const event of ['print:precuenta', 'print:ticket', 'print:factura', 'print:cierre']) {
+      socket.on(event, (payload) => {
+        legacyQueue = legacyQueue.then(() => run({ id: randomUUID(), payload }))
+          .then((result) => console.log(`[print-agent] ${result.estado} ${event}`))
+          .catch((error) => console.error(`[print-agent] ${event}: ${error.message}`));
+      });
+    }
   }
-
-  const args = printArgs.map((arg) => arg.replace('{file}', file).replace('{printer}', printer || ''));
-  const child = spawn(printCommand, args, { stdio: 'inherit', shell: true });
-  child.on('exit', (code) => {
-    if (code !== 0) console.error(`[print-agent] Comando de impresion termino con codigo ${code}`);
-  });
+  socket.on('print:comanda', () => { if (modulo === 'cocina') poll(); });
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { clearInterval(timer); socket.close(); });
 }
-
-function handlePrint(type, payload = {}) {
-  const file = path.join(outputDir, safeName(type, payload));
-  fs.writeFileSync(file, payload.texto || '', 'utf8');
-  runPrintCommand(file, payload.impresora || payload.printer || '');
-}
-
-const socket = io(serverUrl, {
-  transports: ['websocket', 'polling'],
-  reconnection: true,
-  reconnectionAttempts: Infinity,
-});
-
-socket.on('connect', () => {
-  console.log(`[print-agent] Conectado a ${serverUrl}`);
-});
-
-socket.on('print:comanda', (payload) => handlePrint('comanda', payload));
-socket.on('print:precuenta', (payload) => handlePrint('precuenta', payload));
-socket.on('print:ticket', (payload) => handlePrint('ticket', payload));
-socket.on('print:factura', (payload) => handlePrint('factura', payload));
-socket.on('print:cierre', (payload) => handlePrint('cierre', payload));
-
-socket.on('connect_error', (error) => {
-  console.error(`[print-agent] No se pudo conectar: ${error.message}`);
-});
