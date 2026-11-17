@@ -57,7 +57,7 @@ function fixture({ estado = 'PREPARANDO', stock = 5, active = true, advance = fa
       if (sql.startsWith('CREATE TABLE')) return [{}];
       if (sql.startsWith('SELECT id, activo FROM mesas')) return [[{ id: 1, activo: 1 }]];
       if (sql.startsWith('SELECT nombre, precio, tipo FROM extras')) return [[]];
-      if (sql.startsWith('SELECT id, nombre, precio, disponible FROM productos')) return [[{ id: 1, nombre: 'Cafe nuevo', precio: 5, disponible: 1 }]];
+      if (sql.startsWith('SELECT id, nombre, precio, disponible, agotado FROM productos')) return [[{ id: 1, nombre: 'Cafe nuevo', precio: 5, disponible: 1, agotado: 0 }]];
       if (sql.startsWith('SELECT id, total, notas, estado')) return [active ? [{ ...order }] : []];
       if (sql.startsWith('SELECT id, mesa_id FROM pedidos') || sql.startsWith('SELECT mesa_id FROM pedidos') || sql.startsWith('SELECT id, mesa_id, estado FROM pedidos')) return [[{ ...order }]];
       if (sql.startsWith('SELECT id FROM mesas')) return [[{ id: 1 }]];

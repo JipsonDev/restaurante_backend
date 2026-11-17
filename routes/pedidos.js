@@ -18,7 +18,7 @@ import { getBusinessConfig } from '../services/businessConfig.js';
 import { normalizeRole } from '../services/permissions.js';
 import { loadOrderTracking, migrateRoundAttribution } from '../services/orderTracking.js';
 import { listDelayAlerts, claimDelayAlerts, migrateServiceAlerts } from '../services/serviceAlerts.js';
-import { roundTransition } from '../services/kitchenFlow.js';
+import { roundTransition, allItemsReady } from '../services/kitchenFlow.js';
 
 const router = express.Router();
 
@@ -165,6 +165,10 @@ export async function initializeOrderSchema() {
   await ensurePickupFields();
   await ensureSplitTables();
   await migrateRounds();
+  // Cocina: «listo» por plato, agotado temporal y estación de cada producto.
+  await addColumnIfMissing('detalle_pedidos', 'listo_at', 'ALTER TABLE detalle_pedidos ADD COLUMN listo_at DATETIME NULL');
+  await addColumnIfMissing('productos', 'agotado', 'ALTER TABLE productos ADD COLUMN agotado TINYINT(1) NOT NULL DEFAULT 0');
+  await addColumnIfMissing('productos', 'estacion', 'ALTER TABLE productos ADD COLUMN estacion VARCHAR(40) NULL');
   await migrateRoundAttribution(pool);
   await migrateServiceAlerts(pool);
 }
@@ -185,7 +189,7 @@ async function hydrateOrders(rows, db = pool) {
   if (!ids.length) return orders;
 
   const [items] = await db.query(
-    `SELECT dp.id, dp.pedido_id, dp.ronda_id, dp.producto_id, dp.cantidad, dp.precio, dp.notas, pr.nombre
+    `SELECT dp.id, dp.pedido_id, dp.ronda_id, dp.producto_id, dp.cantidad, dp.precio, dp.notas, dp.listo_at, pr.nombre, pr.estacion
      FROM detalle_pedidos dp
      LEFT JOIN productos pr ON dp.producto_id = pr.id
      WHERE dp.pedido_id IN (?)
@@ -216,6 +220,8 @@ async function hydrateOrders(rows, db = pool) {
       cantidad: Number(item.cantidad || 0),
       precio: Number(item.precio || 0),
       notas: item.notas,
+      listo_at: item.listo_at || null,
+      estacion: item.estacion || null,
       modificadores: mods,
     });
     return acc;
@@ -816,12 +822,16 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
       }
 
       const [[product]] = await conn.query(
-        'SELECT id, nombre, precio, disponible FROM productos WHERE id = ?',
+        'SELECT id, nombre, precio, disponible, agotado FROM productos WHERE id = ?',
         [productoId]
       );
       if (!product || Number(product.disponible) !== 1) {
         await conn.rollback();
         return res.status(409).json({ message: `Producto no disponible: ${product?.nombre || productoId}` });
+      }
+      if (Number(product.agotado) === 1) {
+        await conn.rollback();
+        return res.status(409).json({ message: `${product.nombre} está agotado. Quítalo de la ronda para enviarla.` });
       }
       if (req.body.validar_precios && (!Number.isFinite(Number(item.precio)) || Math.round(Number(item.precio) * 100) !== Math.round(Number(product.precio) * 100))) {
         throw Object.assign(new Error(`Cambio el precio de ${product.nombre}. Actualiza y revisa el total antes de enviar.`), { status: 409 });
@@ -1005,10 +1015,12 @@ router.put('/:id/rondas/:rondaId', verifyRole('admin', 'cocina', 'mesero'), asyn
     if (flow.recall) {
       // Deshacer «listo»: vuelve a preparación sin descontar inventario otra vez.
       await conn.query("UPDATE pedido_rondas SET estado = 'PREPARANDO', listo_at = NULL WHERE id = ?", [round.id]);
+      await conn.query('UPDATE detalle_pedidos SET listo_at = NULL WHERE ronda_id = ?', [round.id]);
     } else {
       if (next === 'PREPARANDO') await deductRoundInventory(conn, order.id, round);
       const recordDelivery = next === 'ENTREGADO' && round.estado !== next;
       await conn.query(`UPDATE pedido_rondas SET estado = ?, ${STATE_TS[next]} = COALESCE(${STATE_TS[next]}, NOW())${recordDelivery ? ', entregado_por = ?, entregado_por_nombre = ?' : ''} WHERE id = ?`, [next, ...(recordDelivery ? [req.user.id,String(req.user.nombre || '').slice(0,120) || null] : []), round.id]);
+      if (next === 'LISTO') await conn.query('UPDATE detalle_pedidos SET listo_at = COALESCE(listo_at, NOW()) WHERE ronda_id = ?', [round.id]);
     }
     await refreshAccountState(conn, order.id);
     const freed = next === 'ENTREGADO' ? await freeMesaIfNoActive(conn, order.mesa_id) : false;
@@ -1022,6 +1034,60 @@ router.put('/:id/rondas/:rondaId', verifyRole('admin', 'cocina', 'mesero'), asyn
     res.json({ pedido, ronda_id: round.id, mesa_liberada: freed });
   } catch (error) { await conn.rollback(); res.status(409).json({ message: error.message }); }
   finally { conn.release(); }
+});
+
+// «Listo» por plato. Cocina marca (o desmarca) platos sueltos de una ronda:
+// - si la ronda estaba nueva, se empieza (descuenta inventario como siempre);
+// - cuando todos sus platos están listos, la ronda pasa a LISTO y se avisa al mesero;
+// - desmarcar un plato de una ronda LISTO la devuelve a preparación.
+// Así los platos tachados se ven igual en todas las tablets y el mesero sabe qué puede llevar ya.
+router.put('/:id/rondas/:rondaId/platos', verifyRole('admin', 'cocina'), async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? [...new Set(req.body.ids.map(Number).filter((n) => Number.isSafeInteger(n) && n > 0))] : [];
+  const listo = req.body?.listo !== false;
+  if (!ids.length) return res.status(400).json({ message: 'Indica los platos.' });
+  const conn = await pool.getConnection();
+  try {
+    await beginAccountTransaction(conn);
+    const [[order]] = await conn.query('SELECT id, mesa_id, estado FROM pedidos WHERE id = ? FOR UPDATE', [req.params.id]);
+    if (!order || ['CANCELADO', 'PAGADO'].includes(order.estado)) throw new Error('Cuenta no disponible.');
+    const [[round]] = await conn.query('SELECT * FROM pedido_rondas WHERE id = ? AND pedido_id = ? FOR UPDATE', [req.params.rondaId, order.id]);
+    if (!round) throw new Error('Ronda no encontrada.');
+    if (!['PENDIENTE', 'PREPARANDO', 'LISTO'].includes(round.estado)) throw new Error('La ronda ya se entregó.');
+    let estado = round.estado;
+    if (listo && estado === 'PENDIENTE') {
+      requireExpressPayment(order, 'PREPARANDO');
+      await deductRoundInventory(conn, order.id, round);
+      await conn.query("UPDATE pedido_rondas SET estado = 'PREPARANDO', preparando_at = COALESCE(preparando_at, NOW()) WHERE id = ?", [round.id]);
+      estado = 'PREPARANDO';
+    }
+    const [result] = await conn.query(`UPDATE detalle_pedidos SET listo_at = ${listo ? 'COALESCE(listo_at, NOW())' : 'NULL'} WHERE ronda_id = ? AND id IN (?)`, [round.id, ids]);
+    if (!result.affectedRows) throw new Error('Esos platos no son de esta ronda.');
+    const [items] = await conn.query('SELECT id, cantidad, listo_at FROM detalle_pedidos WHERE ronda_id = ?', [round.id]);
+    let roundReady = false;
+    if (listo && estado === 'PREPARANDO' && allItemsReady(items)) {
+      await conn.query("UPDATE pedido_rondas SET estado = 'LISTO', listo_at = COALESCE(listo_at, NOW()) WHERE id = ?", [round.id]);
+      estado = 'LISTO'; roundReady = true;
+    } else if (!listo && estado === 'LISTO') {
+      await conn.query("UPDATE pedido_rondas SET estado = 'PREPARANDO', listo_at = NULL WHERE id = ?", [round.id]);
+      estado = 'PREPARANDO';
+    }
+    await refreshAccountState(conn, order.id);
+    await safeLogAudit({ conn, user: req.user, accion: listo ? 'ronda.platos_listos' : 'ronda.platos_desmarcados', entidad: 'ronda', entidadId: round.id,
+      metadata: { pedido_id: order.id, platos: ids, estado_ronda: estado } });
+    const pedido = await getPedidoCompleto(order.id, conn);
+    await conn.commit();
+    const names = (pedido.items || []).filter((it) => ids.includes(Number(it.id))).map((it) => `${it.cantidad}× ${it.nombre}`);
+    emitRealtime(EVENTS.ORDER_UPDATED, { pedido, action: listo ? 'platos_listos' : 'platos_desmarcados', ronda_id: round.id, platos: ids, nombres: names, ronda_lista: roundReady });
+    if (roundReady) await notifyWaiterOrderReady(pedido, { rondaId: round.id }).catch((error) => console.warn('Aviso de ronda pendiente:', error.message));
+    else if (listo && names.length) {
+      await sendPushToUser(pedido.mesero_id, { title: `${pedidoUbicacionLabel(pedido)}: plato listo`, body: `${names.join(', ')} listo para llevar.`,
+        data: { type: 'ITEMS_READY', pedido_id: pedido.id, mesa_id: pedido.mesa_id, ronda_id: round.id } }).catch(() => {});
+    }
+    res.json({ pedido, ronda_id: round.id, estado_ronda: estado, ronda_lista: roundReady });
+  } catch (error) {
+    await conn.rollback();
+    res.status(409).json({ message: error.message });
+  } finally { conn.release(); }
 });
 
 router.put('/:id', verifyRole('admin', 'cocina', 'mesero', 'caja'), async (req, res) => {
