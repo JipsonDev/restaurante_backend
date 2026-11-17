@@ -18,6 +18,7 @@ import { getBusinessConfig } from '../services/businessConfig.js';
 import { normalizeRole } from '../services/permissions.js';
 import { loadOrderTracking, migrateRoundAttribution } from '../services/orderTracking.js';
 import { listDelayAlerts, claimDelayAlerts, migrateServiceAlerts } from '../services/serviceAlerts.js';
+import { roundTransition } from '../services/kitchenFlow.js';
 
 const router = express.Router();
 
@@ -999,13 +1000,19 @@ router.put('/:id/rondas/:rondaId', verifyRole('admin', 'cocina', 'mesero'), asyn
     const [[round]] = await conn.query('SELECT * FROM pedido_rondas WHERE id = ? AND pedido_id = ? FOR UPDATE', [req.params.rondaId, order.id]);
     if (!round) throw new Error('Ronda no encontrada.');
     requireExpressPayment(order, next);
-    if (!isValidTransition(round.estado, next)) throw new Error(`Transicion invalida: ${round.estado} -> ${next}`);
-    if (next === 'PREPARANDO') await deductRoundInventory(conn, order.id, round);
-    const recordDelivery = next === 'ENTREGADO' && round.estado !== next;
-    await conn.query(`UPDATE pedido_rondas SET estado = ?, ${STATE_TS[next]} = COALESCE(${STATE_TS[next]}, NOW())${recordDelivery ? ', entregado_por = ?, entregado_por_nombre = ?' : ''} WHERE id = ?`, [next, ...(recordDelivery ? [req.user.id,String(req.user.nombre || '').slice(0,120) || null] : []), round.id]);
+    const flow = roundTransition(round.estado, next, role);
+    if (flow.recall ? !flow.ok : !isValidTransition(round.estado, next)) throw new Error(`Transicion invalida: ${round.estado} -> ${next}`);
+    if (flow.recall) {
+      // Deshacer «listo»: vuelve a preparación sin descontar inventario otra vez.
+      await conn.query("UPDATE pedido_rondas SET estado = 'PREPARANDO', listo_at = NULL WHERE id = ?", [round.id]);
+    } else {
+      if (next === 'PREPARANDO') await deductRoundInventory(conn, order.id, round);
+      const recordDelivery = next === 'ENTREGADO' && round.estado !== next;
+      await conn.query(`UPDATE pedido_rondas SET estado = ?, ${STATE_TS[next]} = COALESCE(${STATE_TS[next]}, NOW())${recordDelivery ? ', entregado_por = ?, entregado_por_nombre = ?' : ''} WHERE id = ?`, [next, ...(recordDelivery ? [req.user.id,String(req.user.nombre || '').slice(0,120) || null] : []), round.id]);
+    }
     await refreshAccountState(conn, order.id);
     const freed = next === 'ENTREGADO' ? await freeMesaIfNoActive(conn, order.mesa_id) : false;
-    await safeLogAudit({ conn, user: req.user, accion: 'ronda.estado_actualizado', entidad: 'ronda', entidadId: round.id,
+    await safeLogAudit({ conn, user: req.user, accion: flow.recall ? 'ronda.listo_deshecho' : 'ronda.estado_actualizado', entidad: 'ronda', entidadId: round.id,
       metadata: { pedido_id: order.id, actor_nombre:req.user.nombre || null, before: round.estado, after: next } });
     const pedido = await getPedidoCompleto(order.id, conn);
     await conn.commit();
