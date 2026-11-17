@@ -56,6 +56,8 @@ function fixture({ estado = 'PREPARANDO', stock = 5, active = true, advance = fa
       if (sql.startsWith('SET TRANSACTION')) return [{}];
       if (sql.startsWith('CREATE TABLE')) return [{}];
       if (sql.startsWith('SELECT id, activo FROM mesas')) return [[{ id: 1, activo: 1 }]];
+      if (sql.includes('FROM reservas WHERE mesa_id = ?')) return [db.reservas || []];
+      if (sql.startsWith('UPDATE reservas SET estado')) { db.seated = params[0]; return [{}]; }
       if (sql.startsWith('SELECT nombre, precio, tipo FROM extras')) return [[]];
       if (sql.startsWith('SELECT id, nombre, precio, disponible, agotado FROM productos')) return [[{ id: 1, nombre: 'Cafe nuevo', precio: 5, disponible: 1, agotado: 0 }]];
       if (sql.startsWith('SELECT id, total, notas, estado')) return [active ? [{ ...order }] : []];
@@ -227,6 +229,40 @@ test('new table and express orders save only their real items and the server tot
     assert.equal(result.body.pedido.mesa_id, tipo === 'Mesa' ? 1 : null);
     assert.match(result.body.comanda, /Cafe nuevo/);
   }
+});
+
+test('una mesa apartada por una reserva no abre cuenta sin confirmar', async () => {
+  const { localNowStamp } = await import('../services/businessTime.js');
+  const reserva = { id: 7, mesa_id: 1, cliente_nombre: 'Ana Pérez', personas: 4, fecha_hora: localNowStamp(new Date(Date.now() + 10 * 60000)), duracion_min: 90, estado: 'CONFIRMADA' };
+  const body = { tipo: 'Mesa', mesa_id: 1, avisar_reserva: true, items: [{ producto_id: 1, cantidad: 1, precio: 5 }] };
+
+  database = fixture({ active: false }); database.reservas = [reserva];
+  const blocked = await request('post', '/', body);
+  assert.equal(blocked.statusCode, 409, JSON.stringify(blocked.body));
+  assert.equal(blocked.body.code, 'MESA_RESERVADA');
+  assert.equal(blocked.body.reserva.id, 7);
+  assert.match(blocked.body.message, /Ana Pérez/);
+  assert.equal(database.committed, 0);
+
+  database = fixture({ active: false }); database.reservas = [reserva];
+  const anyway = await request('post', '/', { ...body, ignorar_reserva: true });
+  assert.equal(anyway.statusCode, 201, JSON.stringify(anyway.body));
+  assert.equal(database.seated, undefined);
+
+  database = fixture({ active: false }); database.reservas = [reserva];
+  const seated = await request('post', '/', { ...body, reserva_id: 7 });
+  assert.equal(seated.statusCode, 201, JSON.stringify(seated.body));
+  assert.equal(database.seated, 7); // la reserva pasa a «Llegó»
+
+  // Una app sin actualizar (no manda avisar_reserva) no se queda bloqueada.
+  database = fixture({ active: false }); database.reservas = [reserva];
+  const old = await request('post', '/', { tipo: 'Mesa', mesa_id: 1, items: [{ producto_id: 1, cantidad: 1, precio: 5 }] });
+  assert.equal(old.statusCode, 201, JSON.stringify(old.body));
+
+  // Con cuenta abierta la reserva no estorba: se añade la ronda.
+  database = fixture({ estado: 'PENDIENTE' }); database.reservas = [reserva];
+  const round = await request('post', '/', body);
+  assert.equal(round.statusCode, 201, JSON.stringify(round.body));
 });
 
 test('products remain available until the stock actually reaches zero', async () => {

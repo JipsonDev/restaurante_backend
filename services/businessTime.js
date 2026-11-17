@@ -6,6 +6,8 @@ export const BUSINESS_TZ = /^[+-](0\d|1[0-4]):[0-5]\d$/.test(raw) ? raw : '-05:0
 
 const local = (expr) => `CONVERT_TZ(${expr}, @@session.time_zone, '${BUSINESS_TZ}')`;
 
+/** Fecha y hora del local para una columna DATETIME (p. ej. para sacar la hora con HOUR()). */
+export const localTime = (column) => local(column);
 /** Fecha (AAAA-MM-DD) del local para una columna o expresión DATETIME. */
 export const localDate = (column) => `DATE(${local(column)})`;
 /** Hoy, en la hora del local. */
@@ -25,4 +27,10 @@ export function localTodayISO(now = new Date()) {
   const [, sign, hh, mm] = BUSINESS_TZ.match(/^([+-])(\d\d):(\d\d)$/);
   const offset = (sign === '-' ? -1 : 1) * (Number(hh) * 60 + Number(mm));
   return new Date(now.getTime() + offset * 60000).toISOString().slice(0, 10);
+}
+/** Fecha y hora del local como texto 'AAAA-MM-DD HH:MM' (el formato de las reservas), calculada en Node. */
+export function localNowStamp(now = new Date()) {
+  const [, sign, hh, mm] = BUSINESS_TZ.match(/^([+-])(\d\d):(\d\d)$/);
+  const offset = (sign === '-' ? -1 : 1) * (Number(hh) * 60 + Number(mm));
+  return new Date(now.getTime() + offset * 60000).toISOString().slice(0, 16).replace('T', ' ');
 }

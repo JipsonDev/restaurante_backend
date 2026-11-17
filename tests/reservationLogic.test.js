@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   addDays, capacityError, findConflict, isLate, minutesUntil, nextByTable, reservationInputError,
-  reservationPayload, suggestTables, toMinutes, transitionError,
+  reservationPayload, suggestTables, toMinutes, transitionError, holdingReservation, arrivingSoon, agendaRange,
 } from '../services/reservationLogic.js';
 
 test('toMinutes acepta fecha local y rechaza fechas imposibles', () => {
@@ -58,4 +58,36 @@ test('retrasos y próxima reserva por mesa', () => {
   const next = nextByTable([r, { ...r, fecha_hora: '2026-11-20 21:00' }, { ...r, mesa_id: 6, fecha_hora: '2026-11-21 13:00' }], '2026-11-20 18:00');
   assert.equal(next[5].fecha_hora, '2026-11-20 19:00');
   assert.equal(next[6], undefined, 'mañana no cuenta como próxima de hoy');
+});
+
+test('la mesa queda apartada 30 min antes y se libera 30 min después si no llegan', () => {
+  const list = [
+    { id: 1, mesa_id: 5, estado: 'CONFIRMADA', fecha_hora: '2026-11-17 19:00', cliente_nombre: 'Ana' },
+    { id: 2, mesa_id: 5, estado: 'CANCELADA', fecha_hora: '2026-11-17 18:00' },
+    { id: 3, mesa_id: 6, estado: 'LLEGO', fecha_hora: '2026-11-17 19:00' },
+    { id: 4, mesa_id: null, estado: 'CONFIRMADA', fecha_hora: '2026-11-17 19:00' },
+  ];
+  assert.equal(holdingReservation(list, 5, '2026-11-17 18:29'), null);
+  assert.equal(holdingReservation(list, 5, '2026-11-17 18:30').id, 1);
+  assert.equal(holdingReservation(list, 5, '2026-11-17 19:30').id, 1);
+  assert.equal(holdingReservation(list, 5, '2026-11-17 19:31'), null);
+  assert.equal(holdingReservation(list, 6, '2026-11-17 19:00'), null); // ya llegó: la cuenta manda
+  assert.equal(holdingReservation(list, 7, '2026-11-17 19:00'), null);
+});
+
+test('aviso de llegada: solo las que faltan 15 min o menos y aún no llegan', () => {
+  const list = [
+    { id: 1, estado: 'CONFIRMADA', fecha_hora: '2026-11-17 19:00' },
+    { id: 2, estado: 'PENDIENTE', fecha_hora: '2026-11-17 19:10' },
+    { id: 3, estado: 'CONFIRMADA', fecha_hora: '2026-11-17 19:40' },
+    { id: 4, estado: 'LLEGO', fecha_hora: '2026-11-17 19:05' },
+    { id: 5, estado: 'CONFIRMADA', fecha_hora: '2026-11-18 19:00' },
+  ];
+  assert.deepEqual(arrivingSoon(list, '2026-11-17 18:55').map(x => [x.reserva.id, x.minutos]), [[1, 5], [2, 15]]);
+  assert.deepEqual(arrivingSoon(list, '2026-11-17 19:00').map(x => x.reserva.id), [2]);
+});
+
+test('la agenda cubre de 11 a 23 y se estira si hay reservas fuera', () => {
+  assert.deepEqual(agendaRange([], '2026-11-17'), { from: 11, to: 23 });
+  assert.deepEqual(agendaRange([{ fecha_hora: '2026-11-17 08:30', duracion_min: 60 }, { fecha_hora: '2026-11-17 22:30', duracion_min: 120 }, { fecha_hora: '2026-11-18 06:00', duracion_min: 60 }], '2026-11-17'), { from: 8, to: 24 });
 });

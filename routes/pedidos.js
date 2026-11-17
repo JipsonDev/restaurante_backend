@@ -9,7 +9,9 @@ import { buildAccountSplit } from '../services/accountLogic.js';
 import { ensurePrintQueue, enqueuePrint } from '../services/printQueue.js';
 import { buildExtrasCatalog, normalizeOrderItem, orderTotal } from '../services/orderAmounts.js';
 import { pool } from '../db.js';
-import { fromLocalDay, toLocalDayEnd } from '../services/businessTime.js';
+import { fromLocalDay, toLocalDayEnd, localNowStamp } from '../services/businessTime.js';
+import { holdingReservation, timeOf, dayOf, addDays, BLOCKING_STATES } from '../services/reservationLogic.js';
+import { ensureReservationsTable } from './reservas.js';
 import { adjustmentsByOrder } from '../services/adjustments.js';
 import { verifyRole } from '../middleware/auth.js';
 import { emitRealtime, EVENTS } from '../realtime.js';
@@ -865,6 +867,7 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
     const businessConfig = await getBusinessConfig();
     await ensureAuditTable();
     await ensurePrintQueue();
+    if (!isPickup) await ensureReservationsTable();
     conn = await pool.getConnection();
     await beginAccountTransaction(conn);
     const replay = await claimOrderRequest(conn, req.user.id, requestKey, req.body);
@@ -949,6 +952,26 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
     const isNewOrder = !activeOrder;
     let pedidoId;
 
+    // Mesa apartada por una reserva: solo se abre cuenta si es esa reserva o si el mesero lo confirma.
+    let seatedReservation = null;
+    if (!isPickup && isNewOrder) {
+      const stamp = localNowStamp();
+      const [todays] = await conn.query(
+        `SELECT id, mesa_id, cliente_nombre, personas, DATE_FORMAT(fecha_hora, '%Y-%m-%d %H:%i') AS fecha_hora, duracion_min, estado
+           FROM reservas WHERE mesa_id = ? AND fecha_hora >= ? AND fecha_hora < ? AND estado IN (${BLOCKING_STATES.map(() => '?').join(', ')})`,
+        [mesaId, `${addDays(dayOf(stamp), -1)} 00:00:00`, `${addDays(dayOf(stamp), 2)} 00:00:00`, ...BLOCKING_STATES],
+      );
+      const held = holdingReservation(todays, mesaId, stamp);
+      const wanted = req.body.reserva_id == null ? null : Number(req.body.reserva_id);
+      if (wanted) seatedReservation = todays.find(r => Number(r.id) === wanted && ['PENDIENTE', 'CONFIRMADA'].includes(r.estado)) || null;
+      // Solo se frena a las apps que saben preguntar (avisar_reserva); una app sin actualizar sigue trabajando.
+      if (held && !seatedReservation && req.body.avisar_reserva === true && req.body.ignorar_reserva !== true) {
+        await conn.rollback();
+        return res.status(409).json({ code: 'MESA_RESERVADA', reserva: held,
+          message: `La mesa está reservada a las ${timeOf(held.fecha_hora)} para ${held.cliente_nombre}. Confirma si llegó la reserva o si vas a usar la mesa de todos modos.` });
+      }
+    }
+
     if (activeOrder) {
       pedidoId = activeOrder.id;
       const mergedNotes = [activeOrder.notas, notas].filter(Boolean).join(' | ');
@@ -967,6 +990,7 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
         [mesaId, mesero_id || req.user.id, Number(finalTotal.toFixed(2)), normalizedTipo, notas]
       );
       pedidoId = result.insertId;
+      if (seatedReservation) await conn.query("UPDATE reservas SET estado = 'LLEGO', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [seatedReservation.id]);
     }
 
     if (!targetId) await conn.query(
@@ -1061,6 +1085,7 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
     });
     emitRealtime(EVENTS.PRINT_COMANDA, { ...printPayload, job_id: printJob.id });
     if (mesaId) await emitTableOccupied(mesaId, { pedido_id: pedidoId });
+    if (seatedReservation) emitRealtime(EVENTS.RESERVATION_UPDATED, { action: 'estado', reserva: { ...seatedReservation, estado: 'LLEGO' } });
 
     res.status(201).json(response);
   } catch (error) {
