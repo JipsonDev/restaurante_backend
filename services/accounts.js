@@ -11,6 +11,10 @@ export async function mergeAccounts(conn, orders, targetId) {
   await conn.query('DELETE FROM cuenta_divisiones WHERE pedido_id IN (?)', [ids]);
   await conn.query('UPDATE detalle_pedidos SET pedido_id = ? WHERE pedido_id IN (?)', [targetId, sources]);
   await conn.query('UPDATE pedido_rondas SET pedido_id = ? WHERE pedido_id IN (?)', [targetId, sources]);
+  // Descuentos y cortesías viajan con sus platos (los totales ya los descuentan).
+  await conn.query('UPDATE cuenta_ajustes SET pedido_id = ? WHERE pedido_id IN (?)', [targetId, sources]).catch((error) => {
+    if (error.code !== 'ER_NO_SUCH_TABLE' && !/no such table/i.test(error.message || '')) throw error;
+  });
   const cents = orders.reduce((sum, order) => sum + Math.round(Number(order.total) * 100), 0);
   await conn.query('UPDATE pedidos SET total = ?, notas = ?, cuenta_solicitada_at = NULL WHERE id = ?',
     [cents / 100, orders.map((order) => order.notas).filter(Boolean).join(' | ') || null, targetId]);

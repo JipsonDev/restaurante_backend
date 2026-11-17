@@ -9,6 +9,8 @@ import { buildAccountSplit } from '../services/accountLogic.js';
 import { ensurePrintQueue, enqueuePrint } from '../services/printQueue.js';
 import { buildExtrasCatalog, normalizeOrderItem, orderTotal } from '../services/orderAmounts.js';
 import { pool } from '../db.js';
+import { fromLocalDay, toLocalDayEnd } from '../services/businessTime.js';
+import { adjustmentsByOrder } from '../services/adjustments.js';
 import { verifyRole } from '../middleware/auth.js';
 import { emitRealtime, EVENTS } from '../realtime.js';
 import { sendPushToUser } from './notificaciones.js';
@@ -221,7 +223,16 @@ async function hydrateOrders(rows, db = pool) {
   }, {});
 
   const [rounds] = await db.query('SELECT * FROM pedido_rondas WHERE pedido_id IN (?) ORDER BY id', [ids]);
-  return orders.map((order) => decorateAccount(order, byOrder[order.id] || [], rounds.filter((round) => Number(round.pedido_id) === Number(order.id))));
+  // Descuentos y cortesías: el plato en cortesía se marca; la cuenta lleva la base descontada para el comprobante.
+  const adjustments = await adjustmentsByOrder(ids, db);
+  return orders.map((order) => {
+    const ajustes = adjustments.get(Number(order.id)) || [];
+    const courtesy = new Map(ajustes.filter((a) => a.tipo === 'CORTESIA').map((a) => [Number(a.detalle_pedido_id), a]));
+    const items = (byOrder[order.id] || []).map((item) => courtesy.has(Number(item.id)) ? { ...item, cortesia: { id: courtesy.get(Number(item.id)).id, motivo: courtesy.get(Number(item.id)).motivo } } : item);
+    const decorated = decorateAccount(order, items, rounds.filter((round) => Number(round.pedido_id) === Number(order.id)));
+    return ajustes.length ? { ...decorated, ajustes, ajustes_base: ajustes.reduce((sum, a) => sum + Math.round(a.base * 100), 0) / 100,
+      ajustes_total: ajustes.reduce((sum, a) => sum + Math.round(a.monto * 100), 0) / 100 } : decorated;
+  });
 }
 
 export async function getPedidoCompleto(id, db = pool) {
@@ -704,7 +715,7 @@ router.get('/express/historial', async (req, res) => {
       FROM pedidos p LEFT JOIN trabajadores t ON t.id = p.mesero_id
       WHERE p.mesa_id IS NULL AND p.tipo IN ('Para llevar', 'Delivery') AND p.estado = 'PAGADO'
       AND NOT EXISTS (SELECT 1 FROM pedido_rondas r WHERE r.pedido_id = p.id AND r.estado IN ('PENDIENTE', 'PREPARANDO', 'LISTO'))
-      AND ${closedAt} >= ? AND ${closedAt} < DATE_ADD(?, INTERVAL 1 DAY)
+      AND ${closedAt} >= ${fromLocalDay()} AND ${closedAt} < ${toLocalDayEnd()}
       ORDER BY cerrado_at DESC, p.id DESC LIMIT 51 OFFSET ?`, [date, date, page * 50]);
     res.json({ items: await hydrateOrders(rows.slice(0, 50)), hasMore: rows.length > 50, fecha: date, page });
   } catch (error) { res.status(500).json({ message: 'No se pudo cargar el historial Express.' }); }
@@ -1299,7 +1310,7 @@ async function splitAccount(req, res, preview = false, overrideMode = null) {
 }
 router.post('/:id/split/equal', verifyRole('admin', 'mesero', 'caja'), (req, res) => splitAccount(req, res, true, 'equal'));
 router.post('/:id/split/items', verifyRole('admin', 'mesero', 'caja'), (req, res) => splitAccount(req, res, true, 'items'));
-router.post('/:id/split/request', verifyRole('admin', 'mesero'), (req, res) => splitAccount(req, res));
+router.post('/:id/split/request', verifyRole('admin', 'mesero', 'caja'), (req, res) => splitAccount(req, res));
 
 router.delete('/:id', verifyRole('admin', 'mesero'), async (req, res) => {
   const conn = await pool.getConnection();

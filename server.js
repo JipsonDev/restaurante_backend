@@ -20,6 +20,7 @@ import extrasRoutes from './routes/extras.js';
 import notificacionesRoutes from './routes/notificaciones.js';
 import auditoriaRoutes from './routes/auditoria.js';
 import configuracionRoutes from './routes/configuracion.js';
+import revisionDatosRoutes from './routes/revisionDatos.js';
 import impresionesRoutes from './routes/impresiones.js';
 import reservasRoutes, { ensureReservationsTable } from './routes/reservas.js';
 import { ensurePrintQueue } from './services/printQueue.js';
@@ -81,6 +82,7 @@ app.use('/api/extras', verifyToken, extrasRoutes);
 app.use('/api/notificaciones', verifyToken, notificacionesRoutes);
 app.use('/api/auditoria', verifyToken, auditoriaRoutes);
 app.use('/api/configuracion', verifyToken, configuracionRoutes);
+app.use('/api/revision-datos', verifyToken, revisionDatosRoutes);
 app.use('/api/reservas', verifyToken, reservasRoutes);
 app.use('/api/impresiones', impresionesRoutes);
 

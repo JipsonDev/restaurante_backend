@@ -420,6 +420,7 @@ test('moving a whole table merges every unpaid source/destination account and ca
       if (sql.startsWith('SELECT dpm.id')) return [[]];
       if (sql.startsWith('SELECT * FROM pedido_rondas')) return [rounds.filter((r) => args[0].includes(r.pedido_id))];
       if (sql.startsWith('SELECT m.id')) return [[]];
+      if (sql.startsWith('UPDATE cuenta_ajustes')) return [{}];
       throw new Error(`Unexpected transfer SQL: ${sql}`);
     },
   };

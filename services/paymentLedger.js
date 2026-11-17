@@ -1,4 +1,5 @@
 import { cashAmount, validateMethod } from './cashLogic.js';
+import { fromLocalDay, toLocalDayEnd } from './businessTime.js';
 
 export function paymentError(message, statusCode = 400) {
   return Object.assign(new Error(message), { statusCode });
@@ -20,17 +21,23 @@ export function paymentPlan(body, total, paid = 0) {
   });
   if (parts.reduce((sum, p) => sum + cents(p.monto), 0) !== cents(amount)) throw paymentError('El desglose debe sumar exactamente el monto a cobrar.');
   const cash = parts.find((p) => p.metodo === 'Efectivo')?.monto || 0;
-  const received = cash ? cashAmount(body.efectivo_recibido ?? cash) : 0;
-  if (cents(received) < cents(cash)) throw paymentError('El efectivo recibido es insuficiente.');
-  return { amount, parts, received, change: (cents(received) - cents(cash)) / 100, paidBefore: cents(paid) / 100,
-    remaining: (due - cents(amount)) / 100, complete: cents(amount) === due };
+  // Propina: va aparte del total de la cuenta. Si se deja en efectivo, el efectivo recibido también la cubre.
+  const tip = body.propina == null || body.propina === '' ? 0 : cashAmount(body.propina);
+  const tipMethod = tip > 0 ? (body.propina_metodo || (body.metodo === 'Mixto' ? 'Efectivo' : (body.metodo || 'Efectivo'))) : null;
+  if (tipMethod) validateMethod(tipMethod);
+  if (cents(tip) > cents(amount) * 2 + 2000) throw paymentError('La propina parece demasiado alta. Revisa el monto.');
+  const cashNeeded = cents(cash) + (tipMethod === 'Efectivo' ? cents(tip) : 0);
+  const received = cashNeeded ? cashAmount(body.efectivo_recibido ?? cashNeeded / 100) : 0;
+  if (cents(received) < cashNeeded) throw paymentError('El efectivo recibido es insuficiente.');
+  return { amount, parts, received, change: (cents(received) - cashNeeded) / 100, paidBefore: cents(paid) / 100,
+    remaining: (due - cents(amount)) / 100, complete: cents(amount) === due, tip, tipMethod };
 }
 
 export function historyFilters(query) {
   const where = [], args = [];
   const date = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0,10) === value;
-  if (query.desde) { if (!date(query.desde)) throw paymentError('Fecha inicial invalida (AAAA-MM-DD).'); where.push('pg.created_at >= ?'); args.push(query.desde); }
-  if (query.hasta) { if (!date(query.hasta)) throw paymentError('Fecha final invalida (AAAA-MM-DD).'); where.push('pg.created_at < DATE_ADD(?, INTERVAL 1 DAY)'); args.push(query.hasta); }
+  if (query.desde) { if (!date(query.desde)) throw paymentError('Fecha inicial invalida (AAAA-MM-DD).'); where.push(`pg.created_at >= ${fromLocalDay()}`); args.push(query.desde); }
+  if (query.hasta) { if (!date(query.hasta)) throw paymentError('Fecha final invalida (AAAA-MM-DD).'); where.push(`pg.created_at < ${toLocalDayEnd()}`); args.push(query.hasta); }
   if (query.desde && query.hasta && query.desde > query.hasta) throw paymentError('La fecha inicial no puede ser posterior a la final.');
   if (query.q) { const q = `%${String(query.q).trim().slice(0,160)}%`; where.push('(pg.comprobante_numero LIKE ? OR pg.factura_cliente LIKE ? OR pg.factura_documento LIKE ? OR p.cliente_nombre LIKE ?)'); args.push(q,q,q,q); }
   if (query.metodo) { if (query.metodo !== 'Mixto') validateMethod(query.metodo); where.push('(pg.metodo = ? OR EXISTS (SELECT 1 FROM pago_desglose pd WHERE pd.pago_id = pg.id AND pd.metodo = ?))'); args.push(query.metodo,query.metodo); }
