@@ -5,6 +5,9 @@ import express from 'express';
 import { beginAccountTransaction, emitMergedAccounts, consolidateAccount } from '../services/accounts.js';
 import { refreshAccountState } from '../services/rounds.js';
 import { pool } from '../db.js';
+import { isLocalToday } from '../services/businessTime.js';
+import { adjustmentTotals, ensureAdjustments, planAdjustment } from '../services/adjustments.js';
+import { agentOnline, enqueuePrint, ensurePrintQueue } from '../services/printQueue.js';
 import { getPedidoCompleto, transitionPedido } from './pedidos.js';
 import { emitRealtime, EVENTS } from '../realtime.js';
 import { getMesaPayload } from '../services/tableState.js';
@@ -48,6 +51,10 @@ async function ensureCajaFields() {
   if (cajaFieldsReady) return;
   await addColumnIfMissing('caja', 'observacion_apertura', 'ALTER TABLE caja ADD COLUMN observacion_apertura VARCHAR(255) NULL');
   await addColumnIfMissing('caja', 'observacion_cierre', 'ALTER TABLE caja ADD COLUMN observacion_cierre VARCHAR(255) NULL');
+  await addColumnIfMissing('caja', 'total_propinas', 'ALTER TABLE caja ADD COLUMN total_propinas DECIMAL(10,2) NOT NULL DEFAULT 0');
+  await addColumnIfMissing('caja', 'total_propinas_efectivo', 'ALTER TABLE caja ADD COLUMN total_propinas_efectivo DECIMAL(10,2) NOT NULL DEFAULT 0');
+  await addColumnIfMissing('caja', 'total_descuentos', 'ALTER TABLE caja ADD COLUMN total_descuentos DECIMAL(10,2) NOT NULL DEFAULT 0');
+  await addColumnIfMissing('caja', 'total_cortesias', 'ALTER TABLE caja ADD COLUMN total_cortesias DECIMAL(10,2) NOT NULL DEFAULT 0');
   cajaFieldsReady = true;
 }
 
@@ -75,6 +82,8 @@ async function ensurePaymentFields() {
   await addColumnIfMissing('pagos', 'impresion_intentos', 'ALTER TABLE pagos ADD COLUMN impresion_intentos INT NOT NULL DEFAULT 0');
   await addColumnIfMissing('pagos', 'impresion_error', 'ALTER TABLE pagos ADD COLUMN impresion_error VARCHAR(255) NULL');
   await addColumnIfMissing('pagos', 'impresion_at', 'ALTER TABLE pagos ADD COLUMN impresion_at DATETIME NULL');
+  await addColumnIfMissing('pagos', 'propina', 'ALTER TABLE pagos ADD COLUMN propina DECIMAL(10,2) NOT NULL DEFAULT 0');
+  await addColumnIfMissing('pagos', 'propina_metodo', 'ALTER TABLE pagos ADD COLUMN propina_metodo VARCHAR(30) NULL');
   await pool.query(`CREATE TABLE IF NOT EXISTS pago_desglose (
     id INT AUTO_INCREMENT PRIMARY KEY, pago_id INT NOT NULL, metodo VARCHAR(30) NOT NULL,
     monto DECIMAL(10,2) NOT NULL, referencia VARCHAR(255) NULL,
@@ -243,7 +252,28 @@ export async function cajaTotals(cajaId, db = pool) {
     gastos: Number(moves.gastos || 0),
     devoluciones: Number(moves.devoluciones || 0),
     anulaciones: Number(moves.anulaciones || 0),
+    ...await tipTotals(cajaId, db),
+    ...await adjustmentTotals(cajaId, db).catch(() => ({ descuentos: 0, cortesias: 0, ajustes: 0 })),
   };
+}
+
+// Propinas del turno: aparte de las ventas. Las de efectivo quedan en el cajón hasta entregarlas.
+async function tipTotals(cajaId, db = pool) {
+  try {
+    const [[tips]] = await db.query(`SELECT COALESCE(SUM(propina), 0) AS propinas,
+        COALESCE(SUM(CASE WHEN propina_metodo = 'Efectivo' THEN propina ELSE 0 END), 0) AS propinas_efectivo
+      FROM pagos WHERE caja_id = ? AND COALESCE(estado, 'ACTIVO') = 'ACTIVO'`, [cajaId]);
+    const [byWaiter] = await db.query(`SELECT COALESCE(t.nombre, 'Sin mesero') AS mesero, p.mesero_id,
+        COALESCE(SUM(pg.propina), 0) AS propina, COALESCE(SUM(CASE WHEN pg.propina_metodo = 'Efectivo' THEN pg.propina ELSE 0 END), 0) AS efectivo
+      FROM pagos pg JOIN pedidos p ON p.id = pg.pedido_id LEFT JOIN trabajadores t ON t.id = p.mesero_id
+      WHERE pg.caja_id = ? AND COALESCE(pg.estado, 'ACTIVO') = 'ACTIVO' AND pg.propina > 0
+      GROUP BY p.mesero_id, t.nombre ORDER BY propina DESC`, [cajaId]);
+    return { propinas: Number(tips.propinas || 0), propinas_efectivo: Number(tips.propinas_efectivo || 0),
+      propinas_por_mesero: byWaiter.map((row) => ({ mesero: row.mesero, mesero_id: row.mesero_id, propina: Number(row.propina), efectivo: Number(row.efectivo) })) };
+  } catch (error) {
+    if (!/propina/.test(error.message || '')) console.error('[caja] propinas:', error.message);
+    return { propinas: 0, propinas_efectivo: 0, propinas_por_mesero: [] };
+  }
 }
 
 async function getOpenCaja(trabajadorId, db = pool) {
@@ -303,7 +333,7 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
       `SELECT COALESCE(SUM(monto), 0) AS total_cobrado,
               COUNT(*) AS pagos_hoy
        FROM pagos
-       WHERE DATE(created_at) = CURDATE()
+       WHERE ${isLocalToday('created_at')}
          AND COALESCE(estado, 'ACTIVO') = 'ACTIVO'`
     ))[0][0], { total_cobrado: 0, pagos_hoy: 0 });
     const pendientes = await parte('cuentas por cobrar', async () => (await pool.query(
@@ -325,7 +355,7 @@ router.get('/resumen', verifyRole('admin', 'caja', 'supervisor'), async (req, re
        FROM pagos pg
        LEFT JOIN pedidos p ON pg.pedido_id = p.id
        LEFT JOIN mesas m ON p.mesa_id = m.id
-       WHERE ${cajaId ? 'pg.caja_id = ?' : 'DATE(pg.created_at) = CURDATE()'}
+       WHERE ${cajaId ? 'pg.caja_id = ?' : isLocalToday('pg.created_at')}
        ORDER BY pg.created_at DESC
        LIMIT 30`, cajaId ? [cajaId] : []
     ))[0], []);
@@ -464,6 +494,105 @@ router.post('/abrir', requirePermission('cash_open_close'), async (req, res) => 
   } finally { conn?.release(); }
 });
 
+// ── Descuentos y cortesías ─────────────────────────────────────────────────
+// Bajan el total de la cuenta. Siempre llevan motivo y la autorización de un admin o supervisor
+// (la sesión si ese es el rol, o su correo y PIN). Quedan ligados al turno para el corte.
+router.post('/cuentas/:id/ajustes', verifyRole('admin', 'supervisor', 'caja'), async (req, res) => {
+  const pedidoId = Number(req.params.id);
+  const motivo = String(req.body.motivo || '').trim().slice(0, 160);
+  if (!motivo) return res.status(400).json({ message: 'Escribe el motivo del descuento o la cortesía.' });
+  let conn;
+  try {
+    const authorization = await resolveQuickAuthorization(req, { roles: ['admin', 'supervisor'] });
+    await ensureAdjustments();
+    const businessConfig = await getBusinessConfig();
+    conn = await pool.getConnection();
+    await beginAccountTransaction(conn);
+    const caja = await lockCashRegister(conn);
+    if (!caja) throw paymentError('Abre la caja antes de aplicar descuentos o cortesías.', 409);
+    const account = await consolidateAccount(conn, pedidoId);
+    const [[pedido]] = await conn.query('SELECT * FROM pedidos WHERE id = ? FOR UPDATE', [pedidoId]);
+    if (!pedido || ['PAGADO', 'CANCELADO'].includes(pedido.estado)) throw paymentError('La cuenta ya no está abierta.', 409);
+    const order = await getPedidoCompleto(pedidoId, conn);
+    const plan = planAdjustment(order, req.body, businessConfig.servicio_porcentaje);
+    const [saved] = await conn.query(`INSERT INTO cuenta_ajustes (pedido_id, tipo, detalle_pedido_id, porcentaje, base, monto, motivo, trabajador_id, autorizado_por, caja_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [pedidoId, plan.tipo, plan.detalle_pedido_id, plan.porcentaje, plan.base, plan.monto, motivo, req.user.id, authorization.user.id, caja.id]);
+    await conn.query('UPDATE pedidos SET total = ? WHERE id = ?', [(cents(pedido.total) - cents(plan.monto)) / 100, pedidoId]);
+    // Los repartos pendientes tenían importes del total anterior.
+    await conn.query("DELETE FROM cuenta_divisiones WHERE pedido_id = ? AND estado = 'PENDIENTE'", [pedidoId]);
+    await safeLogAudit({ conn, user: req.user, accion: plan.tipo === 'CORTESIA' ? 'caja.cortesia' : 'caja.descuento', entidad: 'pedido', entidadId: pedidoId,
+      descripcion: `${plan.tipo === 'CORTESIA' ? 'Cortesía' : 'Descuento'} de ${plan.monto.toFixed(2)}: ${motivo}`,
+      metadata: { ajuste_id: saved.insertId, ...plan, motivo, caja_id: caja.id, autorizado_por: authorization.user.id, autorizado_via: authorization.via } });
+    const pedidoActualizado = await getPedidoCompleto(pedidoId, conn);
+    await conn.commit();
+    emitMergedAccounts(account.orders, pedidoId);
+    emitRealtime(EVENTS.ORDER_UPDATED, { pedido: pedidoActualizado, pedido_id: pedidoId, action: 'ajuste' });
+    emitRealtime(EVENTS.CASH_UPDATED, { action: 'ajuste', caja_id: caja.id });
+    res.status(201).json({ message: plan.tipo === 'CORTESIA' ? 'Cortesía aplicada.' : 'Descuento aplicado.', ajuste: { id: saved.insertId, ...plan, motivo }, pedido: pedidoActualizado });
+  } catch (error) {
+    if (conn) await conn.rollback().catch(() => {});
+    res.status(error.statusCode || (/inválid|supera|Escribe|No queda|pertenece|ya es/.test(error.message) ? 400 : 500)).json({ message: error.message });
+  } finally { conn?.release(); }
+});
+
+router.post('/ajustes/:id/anular', verifyRole('admin', 'supervisor', 'caja'), async (req, res) => {
+  let conn;
+  try {
+    const authorization = await resolveQuickAuthorization(req, { roles: ['admin', 'supervisor'] });
+    await ensureAdjustments();
+    conn = await pool.getConnection();
+    await beginAccountTransaction(conn);
+    const [[ajuste]] = await conn.query("SELECT * FROM cuenta_ajustes WHERE id = ? AND estado = 'ACTIVO' FOR UPDATE", [req.params.id]);
+    if (!ajuste) throw paymentError('El ajuste ya no está activo.', 404);
+    const [[pedido]] = await conn.query('SELECT * FROM pedidos WHERE id = ? FOR UPDATE', [ajuste.pedido_id]);
+    if (!pedido || ['PAGADO', 'CANCELADO'].includes(pedido.estado)) throw paymentError('La cuenta ya se cobró; no se puede quitar el ajuste.', 409);
+    await conn.query("UPDATE cuenta_ajustes SET estado = 'ANULADO', anulado_at = NOW() WHERE id = ?", [ajuste.id]);
+    await conn.query('UPDATE pedidos SET total = ? WHERE id = ?', [(cents(pedido.total) + cents(ajuste.monto)) / 100, pedido.id]);
+    await conn.query("DELETE FROM cuenta_divisiones WHERE pedido_id = ? AND estado = 'PENDIENTE'", [pedido.id]);
+    await safeLogAudit({ conn, user: req.user, accion: 'caja.ajuste_quitado', entidad: 'pedido', entidadId: Number(pedido.id),
+      descripcion: `Se quitó ${ajuste.tipo === 'CORTESIA' ? 'la cortesía' : 'el descuento'} de ${Number(ajuste.monto).toFixed(2)}`,
+      metadata: { ajuste_id: ajuste.id, autorizado_por: authorization.user.id, autorizado_via: authorization.via } });
+    const pedidoActualizado = await getPedidoCompleto(pedido.id, conn);
+    await conn.commit();
+    emitRealtime(EVENTS.ORDER_UPDATED, { pedido: pedidoActualizado, pedido_id: pedido.id, action: 'ajuste' });
+    emitRealtime(EVENTS.CASH_UPDATED, { action: 'ajuste', caja_id: ajuste.caja_id });
+    res.json({ message: 'Ajuste quitado.', pedido: pedidoActualizado });
+  } catch (error) {
+    if (conn) await conn.rollback().catch(() => {});
+    res.status(error.statusCode || 500).json({ message: error.message });
+  } finally { conn?.release(); }
+});
+
+// ── Impresión directa en la impresora de caja (agente en la PC) ───────────
+// El navegador no puede imprimir sin diálogo; el agente de impresión sí. Si no está conectado,
+// se responde 409 y la caja usa la ventana de impresión del navegador como respaldo.
+router.post('/imprimir', verifyRole('admin', 'supervisor', 'caja'), async (req, res) => {
+  const texto = String(req.body.texto || '');
+  const soloCajon = req.body.solo_cajon === true;
+  if (!soloCajon && !texto.trim()) return res.status(400).json({ message: 'No hay nada que imprimir.' });
+  if (texto.length > 20000) return res.status(400).json({ message: 'El comprobante es demasiado largo.' });
+  if (!agentOnline('caja')) return res.status(409).json({ message: 'El agente de impresión de caja no está conectado.', sin_agente: true });
+  let conn;
+  try {
+    await ensurePrintQueue();
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+    const caja = soloCajon ? await lockCashRegister(conn) : null;
+    if (soloCajon && !caja) throw paymentError('Abre la caja antes de abrir el cajón.', 409);
+    const job = await enqueuePrint(conn, { modulo: 'caja', pedido_id: Number(req.body.pedido_id) || 0, pago_id: Number(req.body.pago_id) || null,
+      titulo: String(req.body.titulo || 'Comprobante').slice(0, 80), texto, abrir_cajon: req.body.abrir_cajon === true || soloCajon, solo_cajon: soloCajon,
+      logo_url: req.body.logo_url || null });
+    if (soloCajon) await safeLogAudit({ conn, user: req.user, accion: 'caja.cajon_abierto', entidad: 'caja', entidadId: Number(caja.id),
+      descripcion: `Cajón abierto sin venta: ${String(req.body.motivo || 'sin motivo').slice(0, 120)}`, metadata: { motivo: req.body.motivo || null } });
+    await conn.commit();
+    emitRealtime('print:wake', { modulo: 'caja' });
+    res.status(202).json({ job_id: job.id, estado: job.estado });
+  } catch (error) {
+    if (conn) await conn.rollback().catch(() => {});
+    res.status(error.statusCode || 500).json({ message: error.message });
+  } finally { conn?.release(); }
+});
+
 router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
   const {
     pedido_id,
@@ -496,7 +625,8 @@ router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
     if ((req.body.parcial || metodo === 'Mixto' || req.body.division_id) && !requestKey) throw paymentError('Este cobro necesita un identificador para evitar duplicados.');
     const fingerprint = JSON.stringify({ pedido_id: Number(pedido_id), metodo, monto: cashAmount(monto), caja_id: Number(req.body.caja_id || 0),
       parcial: !!req.body.parcial, division_id: Number(req.body.division_id || 0), desglose: req.body.desglose || null,
-      recibido: req.body.efectivo_recibido ?? null, referencia, invoiceType, invoiceClient, invoiceDocument, factura_telefono, factura_correo });
+      recibido: req.body.efectivo_recibido ?? null, referencia, invoiceType, invoiceClient, invoiceDocument, factura_telefono, factura_correo,
+      propina: req.body.propina ?? null, propina_metodo: req.body.propina_metodo ?? null });
     await ensureCajaFields();
     await ensurePaymentFields();
     await ensureBillingTables();
@@ -581,10 +711,12 @@ router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
       ]
     );
     const paymentId = savedPayment.insertId;
+    if (plan.tip > 0) await conn.query('UPDATE pagos SET propina = ?, propina_metodo = ? WHERE id = ?', [plan.tip, plan.tipMethod, paymentId]);
     for (const part of plan.parts) await conn.query('INSERT INTO pago_desglose (pago_id, metodo, monto, referencia) VALUES (?, ?, ?, ?)', [paymentId, part.metodo, part.monto, part.referencia]);
     const snapshot = { version: 1, pedido: orderSnapshot, totales: receipt, negocio: businessConfig,
       created_at: new Date().toISOString(), monto: amount, asignacion: allocation, abonado_anterior: plan.paidBefore, saldo_pendiente: plan.remaining,
       efectivo_recibido: plan.received, cambio: plan.change, desglose: plan.parts, metodo,
+      propina: plan.tip, propina_metodo: plan.tip > 0 ? plan.tipMethod : null, mesero: orderSnapshot?.mesero_nombre || null,
       division: division ? { id: division.id, nombre: division.nombre } : null,
       comprobante_numero: comprobanteNumero, comprobante_tipo: comprobanteTipo,
       cliente: { nombre: invoiceClient, documento: invoiceType === 'DOCUMENTO' ? invoiceDocument : null, telefono: factura_telefono, correo: factura_correo },
@@ -988,6 +1120,8 @@ router.post('/cerrar', requirePermission('cash_open_close'), async (req, res) =>
         caja.id,
       ]
     );
+    await conn.query('UPDATE caja SET total_propinas = ?, total_propinas_efectivo = ?, total_descuentos = ?, total_cortesias = ? WHERE id = ?',
+      [totals.propinas || 0, totals.propinas_efectivo || 0, totals.descuentos || 0, totals.cortesias || 0, caja.id]);
     await safeLogAudit({
       conn,
       user: req.user,

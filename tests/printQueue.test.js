@@ -58,7 +58,10 @@ test('failed claims rollback and release their connection', async () => {
 
 test('only the holder of the claim can ACK and simulation remains a separate result', async () => {
   let sent;
-  connection = { query: async (sql, params) => { sent = { sql, params }; return [{ affectedRows: params[3] === 'right' ? 1 : 0 }]; } };
+  connection = { query: async (sql, params) => {
+    if (sql.startsWith('SELECT payload')) return [[{ payload: '{}' }]]; // comprobante de caja: no es de caja, no toca pagos
+    sent = { sql, params }; return [{ affectedRows: params[3] === 'right' ? 1 : 0 }];
+  } };
   assert.equal(await finishPrintJob('job1', 'wrong', 'ENVIADO'), false);
   assert.equal(await finishPrintJob('job1', 'right', 'SIMULADO'), true);
   assert.match(sent.sql, /claim_token = \?/);

@@ -39,7 +39,8 @@ export function buildAccountSplit(account, { mode = 'equal', partes = 2, divisio
       const count = (used.get(id) || 0) + qty;
       if (count > Number(item.cantidad)) throw new Error('Un producto esta asignado mas de una vez.');
       used.set(id, count);
-      weight += (toCents(item.precio) + (item.modificadores || []).reduce((sum, mod) => sum + toCents(mod.precio_extra), 0)) * qty;
+      // Un plato en cortesía no pesa en el reparto: no se cobra.
+      if (!item.cortesia) weight += (toCents(item.precio) + (item.modificadores || []).reduce((sum, mod) => sum + toCents(mod.precio_extra), 0)) * qty;
       return { detalle_pedido_id: id, cantidad: qty };
     });
     return { nombre: String(group.nombre || `Comensal ${i + 1}`).trim().slice(0, 80), items, weight };

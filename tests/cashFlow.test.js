@@ -56,6 +56,9 @@ function fixture({ open = true, payments = [], movements = [] } = {}) {
       Object.assign(state.cajas.find((c) => c.id === args.at(-1)), { estado: 'Cerrada', monto_final: args[0], efectivo_esperado: args[2], diferencia_cierre: args[3] }); return [{}];
     }
     if (sql.startsWith('UPDATE caja SET monto_final')) return [{}];
+    if (sql.startsWith('UPDATE caja SET total_propinas')) return [{}];
+    if (sql.includes('SUM(propina)') || sql.includes('SUM(pg.propina)')) return [sql.includes('GROUP BY') ? [] : [{ propinas: 0, propinas_efectivo: 0 }]];
+    if (sql.includes('FROM cuenta_ajustes')) return [sql.includes('AS descuentos') ? [{ descuentos: 0, cortesias: 0, ajustes: 0 }] : []];
     if (sql.startsWith('INSERT INTO caja_movimientos')) {
       const reversal = sql.includes("'ANULACION'") || sql.includes("'DEVOLUCION'");
       state.movements.push({ caja_id: args[0], tipo: reversal ? (sql.includes("'ANULACION'") ? 'ANULACION' : 'DEVOLUCION') : args[2], monto: args[reversal ? 2 : 3], metodo: args[reversal ? 3 : 4] }); return [{ insertId: state.movements.length }];

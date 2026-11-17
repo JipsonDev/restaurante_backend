@@ -28,4 +28,5 @@ export const EVENTS = {
   RESERVATION_UPDATED: 'reservation:updated',
   PRINT_COMANDA: 'print:comanda',
   PRINT_PRECUENTA: 'print:precuenta',
+  CATALOG_UPDATED: 'catalog:updated',
 };

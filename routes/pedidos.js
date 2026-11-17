@@ -9,6 +9,8 @@ import { buildAccountSplit } from '../services/accountLogic.js';
 import { ensurePrintQueue, enqueuePrint } from '../services/printQueue.js';
 import { buildExtrasCatalog, normalizeOrderItem, orderTotal } from '../services/orderAmounts.js';
 import { pool } from '../db.js';
+import { fromLocalDay, toLocalDayEnd } from '../services/businessTime.js';
+import { adjustmentsByOrder } from '../services/adjustments.js';
 import { verifyRole } from '../middleware/auth.js';
 import { emitRealtime, EVENTS } from '../realtime.js';
 import { sendPushToUser } from './notificaciones.js';
@@ -18,6 +20,7 @@ import { getBusinessConfig } from '../services/businessConfig.js';
 import { normalizeRole } from '../services/permissions.js';
 import { loadOrderTracking, migrateRoundAttribution } from '../services/orderTracking.js';
 import { listDelayAlerts, claimDelayAlerts, migrateServiceAlerts } from '../services/serviceAlerts.js';
+import { roundTransition, allItemsReady } from '../services/kitchenFlow.js';
 
 const router = express.Router();
 
@@ -164,6 +167,10 @@ export async function initializeOrderSchema() {
   await ensurePickupFields();
   await ensureSplitTables();
   await migrateRounds();
+  // Cocina: «listo» por plato, agotado temporal y estación de cada producto.
+  await addColumnIfMissing('detalle_pedidos', 'listo_at', 'ALTER TABLE detalle_pedidos ADD COLUMN listo_at DATETIME NULL');
+  await addColumnIfMissing('productos', 'agotado', 'ALTER TABLE productos ADD COLUMN agotado TINYINT(1) NOT NULL DEFAULT 0');
+  await addColumnIfMissing('productos', 'estacion', 'ALTER TABLE productos ADD COLUMN estacion VARCHAR(40) NULL');
   await migrateRoundAttribution(pool);
   await migrateServiceAlerts(pool);
 }
@@ -184,7 +191,7 @@ async function hydrateOrders(rows, db = pool) {
   if (!ids.length) return orders;
 
   const [items] = await db.query(
-    `SELECT dp.id, dp.pedido_id, dp.ronda_id, dp.producto_id, dp.cantidad, dp.precio, dp.notas, pr.nombre
+    `SELECT dp.id, dp.pedido_id, dp.ronda_id, dp.producto_id, dp.cantidad, dp.precio, dp.notas, dp.listo_at, pr.nombre, pr.estacion
      FROM detalle_pedidos dp
      LEFT JOIN productos pr ON dp.producto_id = pr.id
      WHERE dp.pedido_id IN (?)
@@ -215,13 +222,24 @@ async function hydrateOrders(rows, db = pool) {
       cantidad: Number(item.cantidad || 0),
       precio: Number(item.precio || 0),
       notas: item.notas,
+      listo_at: item.listo_at || null,
+      estacion: item.estacion || null,
       modificadores: mods,
     });
     return acc;
   }, {});
 
   const [rounds] = await db.query('SELECT * FROM pedido_rondas WHERE pedido_id IN (?) ORDER BY id', [ids]);
-  return orders.map((order) => decorateAccount(order, byOrder[order.id] || [], rounds.filter((round) => Number(round.pedido_id) === Number(order.id))));
+  // Descuentos y cortesías: el plato en cortesía se marca; la cuenta lleva la base descontada para el comprobante.
+  const adjustments = await adjustmentsByOrder(ids, db);
+  return orders.map((order) => {
+    const ajustes = adjustments.get(Number(order.id)) || [];
+    const courtesy = new Map(ajustes.filter((a) => a.tipo === 'CORTESIA').map((a) => [Number(a.detalle_pedido_id), a]));
+    const items = (byOrder[order.id] || []).map((item) => courtesy.has(Number(item.id)) ? { ...item, cortesia: { id: courtesy.get(Number(item.id)).id, motivo: courtesy.get(Number(item.id)).motivo } } : item);
+    const decorated = decorateAccount(order, items, rounds.filter((round) => Number(round.pedido_id) === Number(order.id)));
+    return ajustes.length ? { ...decorated, ajustes, ajustes_base: ajustes.reduce((sum, a) => sum + Math.round(a.base * 100), 0) / 100,
+      ajustes_total: ajustes.reduce((sum, a) => sum + Math.round(a.monto * 100), 0) / 100 } : decorated;
+  });
 }
 
 export async function getPedidoCompleto(id, db = pool) {
@@ -704,7 +722,7 @@ router.get('/express/historial', async (req, res) => {
       FROM pedidos p LEFT JOIN trabajadores t ON t.id = p.mesero_id
       WHERE p.mesa_id IS NULL AND p.tipo IN ('Para llevar', 'Delivery') AND p.estado = 'PAGADO'
       AND NOT EXISTS (SELECT 1 FROM pedido_rondas r WHERE r.pedido_id = p.id AND r.estado IN ('PENDIENTE', 'PREPARANDO', 'LISTO'))
-      AND ${closedAt} >= ? AND ${closedAt} < DATE_ADD(?, INTERVAL 1 DAY)
+      AND ${closedAt} >= ${fromLocalDay()} AND ${closedAt} < ${toLocalDayEnd()}
       ORDER BY cerrado_at DESC, p.id DESC LIMIT 51 OFFSET ?`, [date, date, page * 50]);
     res.json({ items: await hydrateOrders(rows.slice(0, 50)), hasMore: rows.length > 50, fecha: date, page });
   } catch (error) { res.status(500).json({ message: 'No se pudo cargar el historial Express.' }); }
@@ -726,6 +744,74 @@ router.get('/:id/seguimiento', verifyRole('admin','mesero','caja'), async (req,r
     if (!order) return res.status(404).json({message:'Pedido no encontrado.'});
     res.json(await loadOrderTracking(pool,order));
   } catch { res.status(500).json({message:'No se pudo consultar el seguimiento del pedido.'}); }
+});
+
+// ── Mantenimiento: cuentas abandonadas ──────────────────────────────────────
+// Cuentas abiertas sin actividad desde hace N días (por defecto 15), normalmente pedidos de prueba
+// que dejan mesas ocupadas y ensucian los reportes. Solo admin. Primero se listan; cerrarlas las
+// marca como CANCELADO (no se borran) con la misma lógica que una cancelación normal: libera la
+// mesa, las reservas y el inventario. Las cuentas con pagos registrados se excluyen (se resuelven en caja).
+const staleDays = value => Math.min(365, Math.max(3, Math.floor(Number(value) || 15)));
+async function listStaleOrders(db, days) {
+  const [rows] = await db.query(
+    `SELECT * FROM (
+       SELECT p.id, p.mesa_id, m.numero AS mesa_numero, p.tipo, p.cliente_nombre, p.estado, p.total, p.created_at,
+              GREATEST(p.created_at, COALESCE((SELECT MAX(r.created_at) FROM pedido_rondas r WHERE r.pedido_id = p.id), p.created_at)) AS ultima_actividad,
+              (SELECT COALESCE(SUM(pg.monto), 0) FROM pagos pg WHERE pg.pedido_id = p.id AND COALESCE(pg.estado, 'ACTIVO') = 'ACTIVO') AS abonado
+       FROM pedidos p
+       LEFT JOIN mesas m ON m.id = p.mesa_id
+       WHERE p.estado NOT IN ('PAGADO', 'CANCELADO')
+         AND p.created_at < DATE_SUB(NOW(), INTERVAL ? DAY)
+     ) abandonados
+     WHERE ultima_actividad < DATE_SUB(NOW(), INTERVAL ? DAY)
+     ORDER BY ultima_actividad ASC
+     LIMIT 500`,
+    [days, days]
+  );
+  return rows.map(r => ({ ...r, total: Number(r.total || 0), abonado: Number(r.abonado || 0), cerrable: Number(r.abonado || 0) <= 0 }));
+}
+
+router.get('/mantenimiento/abandonados', verifyRole('admin'), async (req, res) => {
+  try {
+    const days = staleDays(req.query.dias);
+    const items = await listStaleOrders(pool, days);
+    res.json({ dias: days, items, cerrables: items.filter(i => i.cerrable).length, con_pagos: items.filter(i => !i.cerrable).length });
+  } catch (error) {
+    res.status(500).json({ message: 'No se pudieron revisar las cuentas abandonadas.', detail: error.message });
+  }
+});
+
+router.post('/mantenimiento/abandonados/cerrar', verifyRole('admin'), async (req, res) => {
+  const days = staleDays(req.body?.dias);
+  const ids = Array.isArray(req.body?.ids) ? [...new Set(req.body.ids.map(Number).filter(n => Number.isInteger(n) && n > 0))].slice(0, 500) : [];
+  if (!ids.length) return res.status(400).json({ message: 'Elige al menos una cuenta.' });
+  // Se vuelve a comprobar en el servidor: solo se cierran las que siguen abandonadas y sin pagos.
+  const allowed = new Set((await listStaleOrders(pool, days)).filter(o => o.cerrable).map(o => Number(o.id)));
+  const closed = []; const skipped = []; const freedTables = [];
+  for (const id of ids) {
+    if (!allowed.has(id)) { skipped.push({ id, motivo: 'Ya no está abandonada o tiene pagos.' }); continue; }
+    const conn = await pool.getConnection();
+    try {
+      await beginAccountTransaction(conn);
+      const transition = await transitionPedido(conn, id, 'CANCELADO', { allowShortcut: true });
+      await safeLogAudit({
+        conn, user: req.user, accion: 'pedido.cerrado_por_limpieza', entidad: 'pedido', entidadId: id,
+        descripcion: `Cuenta abandonada (más de ${days} días sin actividad) marcada como cancelada`,
+        metadata: { ...transition, dias: days },
+      });
+      await conn.commit();
+      closed.push(id);
+      if (transition.table_freed && transition.mesa_id) freedTables.push(transition.mesa_id);
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      skipped.push({ id, motivo: error.message });
+    } finally {
+      conn.release();
+    }
+  }
+  for (const id of closed) emitRealtime(EVENTS.ORDER_UPDATED, { pedido_id: id, action: 'cancel' });
+  for (const mesa of [...new Set(freedTables)]) await emitTableFreed(mesa).catch(() => {});
+  res.json({ message: closed.length ? `${closed.length} ${closed.length === 1 ? 'cuenta cerrada' : 'cuentas cerradas'}.` : 'No se cerró ninguna cuenta.', cerradas: closed, omitidas: skipped });
 });
 
 router.get('/:id', async (req, res) => {
@@ -815,12 +901,16 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
       }
 
       const [[product]] = await conn.query(
-        'SELECT id, nombre, precio, disponible FROM productos WHERE id = ?',
+        'SELECT id, nombre, precio, disponible, agotado FROM productos WHERE id = ?',
         [productoId]
       );
       if (!product || Number(product.disponible) !== 1) {
         await conn.rollback();
         return res.status(409).json({ message: `Producto no disponible: ${product?.nombre || productoId}` });
+      }
+      if (Number(product.agotado) === 1) {
+        await conn.rollback();
+        return res.status(409).json({ message: `${product.nombre} está agotado. Quítalo de la ronda para enviarla.` });
       }
       if (req.body.validar_precios && (!Number.isFinite(Number(item.precio)) || Math.round(Number(item.precio) * 100) !== Math.round(Number(product.precio) * 100))) {
         throw Object.assign(new Error(`Cambio el precio de ${product.nombre}. Actualiza y revisa el total antes de enviar.`), { status: 409 });
@@ -999,13 +1089,21 @@ router.put('/:id/rondas/:rondaId', verifyRole('admin', 'cocina', 'mesero'), asyn
     const [[round]] = await conn.query('SELECT * FROM pedido_rondas WHERE id = ? AND pedido_id = ? FOR UPDATE', [req.params.rondaId, order.id]);
     if (!round) throw new Error('Ronda no encontrada.');
     requireExpressPayment(order, next);
-    if (!isValidTransition(round.estado, next)) throw new Error(`Transicion invalida: ${round.estado} -> ${next}`);
-    if (next === 'PREPARANDO') await deductRoundInventory(conn, order.id, round);
-    const recordDelivery = next === 'ENTREGADO' && round.estado !== next;
-    await conn.query(`UPDATE pedido_rondas SET estado = ?, ${STATE_TS[next]} = COALESCE(${STATE_TS[next]}, NOW())${recordDelivery ? ', entregado_por = ?, entregado_por_nombre = ?' : ''} WHERE id = ?`, [next, ...(recordDelivery ? [req.user.id,String(req.user.nombre || '').slice(0,120) || null] : []), round.id]);
+    const flow = roundTransition(round.estado, next, role);
+    if (flow.recall ? !flow.ok : !isValidTransition(round.estado, next)) throw new Error(`Transicion invalida: ${round.estado} -> ${next}`);
+    if (flow.recall) {
+      // Deshacer «listo»: vuelve a preparación sin descontar inventario otra vez.
+      await conn.query("UPDATE pedido_rondas SET estado = 'PREPARANDO', listo_at = NULL WHERE id = ?", [round.id]);
+      await conn.query('UPDATE detalle_pedidos SET listo_at = NULL WHERE ronda_id = ?', [round.id]);
+    } else {
+      if (next === 'PREPARANDO') await deductRoundInventory(conn, order.id, round);
+      const recordDelivery = next === 'ENTREGADO' && round.estado !== next;
+      await conn.query(`UPDATE pedido_rondas SET estado = ?, ${STATE_TS[next]} = COALESCE(${STATE_TS[next]}, NOW())${recordDelivery ? ', entregado_por = ?, entregado_por_nombre = ?' : ''} WHERE id = ?`, [next, ...(recordDelivery ? [req.user.id,String(req.user.nombre || '').slice(0,120) || null] : []), round.id]);
+      if (next === 'LISTO') await conn.query('UPDATE detalle_pedidos SET listo_at = COALESCE(listo_at, NOW()) WHERE ronda_id = ?', [round.id]);
+    }
     await refreshAccountState(conn, order.id);
     const freed = next === 'ENTREGADO' ? await freeMesaIfNoActive(conn, order.mesa_id) : false;
-    await safeLogAudit({ conn, user: req.user, accion: 'ronda.estado_actualizado', entidad: 'ronda', entidadId: round.id,
+    await safeLogAudit({ conn, user: req.user, accion: flow.recall ? 'ronda.listo_deshecho' : 'ronda.estado_actualizado', entidad: 'ronda', entidadId: round.id,
       metadata: { pedido_id: order.id, actor_nombre:req.user.nombre || null, before: round.estado, after: next } });
     const pedido = await getPedidoCompleto(order.id, conn);
     await conn.commit();
@@ -1015,6 +1113,60 @@ router.put('/:id/rondas/:rondaId', verifyRole('admin', 'cocina', 'mesero'), asyn
     res.json({ pedido, ronda_id: round.id, mesa_liberada: freed });
   } catch (error) { await conn.rollback(); res.status(409).json({ message: error.message }); }
   finally { conn.release(); }
+});
+
+// «Listo» por plato. Cocina marca (o desmarca) platos sueltos de una ronda:
+// - si la ronda estaba nueva, se empieza (descuenta inventario como siempre);
+// - cuando todos sus platos están listos, la ronda pasa a LISTO y se avisa al mesero;
+// - desmarcar un plato de una ronda LISTO la devuelve a preparación.
+// Así los platos tachados se ven igual en todas las tablets y el mesero sabe qué puede llevar ya.
+router.put('/:id/rondas/:rondaId/platos', verifyRole('admin', 'cocina'), async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? [...new Set(req.body.ids.map(Number).filter((n) => Number.isSafeInteger(n) && n > 0))] : [];
+  const listo = req.body?.listo !== false;
+  if (!ids.length) return res.status(400).json({ message: 'Indica los platos.' });
+  const conn = await pool.getConnection();
+  try {
+    await beginAccountTransaction(conn);
+    const [[order]] = await conn.query('SELECT id, mesa_id, estado FROM pedidos WHERE id = ? FOR UPDATE', [req.params.id]);
+    if (!order || ['CANCELADO', 'PAGADO'].includes(order.estado)) throw new Error('Cuenta no disponible.');
+    const [[round]] = await conn.query('SELECT * FROM pedido_rondas WHERE id = ? AND pedido_id = ? FOR UPDATE', [req.params.rondaId, order.id]);
+    if (!round) throw new Error('Ronda no encontrada.');
+    if (!['PENDIENTE', 'PREPARANDO', 'LISTO'].includes(round.estado)) throw new Error('La ronda ya se entregó.');
+    let estado = round.estado;
+    if (listo && estado === 'PENDIENTE') {
+      requireExpressPayment(order, 'PREPARANDO');
+      await deductRoundInventory(conn, order.id, round);
+      await conn.query("UPDATE pedido_rondas SET estado = 'PREPARANDO', preparando_at = COALESCE(preparando_at, NOW()) WHERE id = ?", [round.id]);
+      estado = 'PREPARANDO';
+    }
+    const [result] = await conn.query(`UPDATE detalle_pedidos SET listo_at = ${listo ? 'COALESCE(listo_at, NOW())' : 'NULL'} WHERE ronda_id = ? AND id IN (?)`, [round.id, ids]);
+    if (!result.affectedRows) throw new Error('Esos platos no son de esta ronda.');
+    const [items] = await conn.query('SELECT id, cantidad, listo_at FROM detalle_pedidos WHERE ronda_id = ?', [round.id]);
+    let roundReady = false;
+    if (listo && estado === 'PREPARANDO' && allItemsReady(items)) {
+      await conn.query("UPDATE pedido_rondas SET estado = 'LISTO', listo_at = COALESCE(listo_at, NOW()) WHERE id = ?", [round.id]);
+      estado = 'LISTO'; roundReady = true;
+    } else if (!listo && estado === 'LISTO') {
+      await conn.query("UPDATE pedido_rondas SET estado = 'PREPARANDO', listo_at = NULL WHERE id = ?", [round.id]);
+      estado = 'PREPARANDO';
+    }
+    await refreshAccountState(conn, order.id);
+    await safeLogAudit({ conn, user: req.user, accion: listo ? 'ronda.platos_listos' : 'ronda.platos_desmarcados', entidad: 'ronda', entidadId: round.id,
+      metadata: { pedido_id: order.id, platos: ids, estado_ronda: estado } });
+    const pedido = await getPedidoCompleto(order.id, conn);
+    await conn.commit();
+    const names = (pedido.items || []).filter((it) => ids.includes(Number(it.id))).map((it) => `${it.cantidad}× ${it.nombre}`);
+    emitRealtime(EVENTS.ORDER_UPDATED, { pedido, action: listo ? 'platos_listos' : 'platos_desmarcados', ronda_id: round.id, platos: ids, nombres: names, ronda_lista: roundReady });
+    if (roundReady) await notifyWaiterOrderReady(pedido, { rondaId: round.id }).catch((error) => console.warn('Aviso de ronda pendiente:', error.message));
+    else if (listo && names.length) {
+      await sendPushToUser(pedido.mesero_id, { title: `${pedidoUbicacionLabel(pedido)}: plato listo`, body: `${names.join(', ')} listo para llevar.`,
+        data: { type: 'ITEMS_READY', pedido_id: pedido.id, mesa_id: pedido.mesa_id, ronda_id: round.id } }).catch(() => {});
+    }
+    res.json({ pedido, ronda_id: round.id, estado_ronda: estado, ronda_lista: roundReady });
+  } catch (error) {
+    await conn.rollback();
+    res.status(409).json({ message: error.message });
+  } finally { conn.release(); }
 });
 
 router.put('/:id', verifyRole('admin', 'cocina', 'mesero', 'caja'), async (req, res) => {
@@ -1299,7 +1451,7 @@ async function splitAccount(req, res, preview = false, overrideMode = null) {
 }
 router.post('/:id/split/equal', verifyRole('admin', 'mesero', 'caja'), (req, res) => splitAccount(req, res, true, 'equal'));
 router.post('/:id/split/items', verifyRole('admin', 'mesero', 'caja'), (req, res) => splitAccount(req, res, true, 'items'));
-router.post('/:id/split/request', verifyRole('admin', 'mesero'), (req, res) => splitAccount(req, res));
+router.post('/:id/split/request', verifyRole('admin', 'mesero', 'caja'), (req, res) => splitAccount(req, res));
 
 router.delete('/:id', verifyRole('admin', 'mesero'), async (req, res) => {
   const conn = await pool.getConnection();

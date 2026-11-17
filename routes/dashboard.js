@@ -1,5 +1,6 @@
 import express from 'express';
 import { pool } from '../db.js';
+import { isLocalToday, localDate, localDaysAgo, localTodayISO, localTomorrow } from '../services/businessTime.js';
 import { verifyRole } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -9,27 +10,27 @@ router.get('/stats', async (req, res) => {
   try {
     // Pedidos de hoy
     const [[{ pedidosHoy }]] = await pool.query(
-      `SELECT COUNT(*) AS pedidosHoy FROM pedidos WHERE DATE(created_at) = CURDATE()`
+      `SELECT COUNT(*) AS pedidosHoy FROM pedidos WHERE ${isLocalToday('created_at')}`
     );
 
     // Ventas de hoy
     const [[{ ventasHoy }]] = await pool.query(
       `SELECT COALESCE(SUM(total), 0) AS ventasHoy
        FROM pedidos
-       WHERE DATE(created_at) = CURDATE() AND estado = 'PAGADO'`
+       WHERE ${isLocalToday('created_at')} AND estado = 'PAGADO'`
     );
 
     // Ticket promedio
     const [[{ ticketPromedio }]] = await pool.query(
       `SELECT COALESCE(AVG(total), 0) AS ticketPromedio
        FROM pedidos
-       WHERE DATE(created_at) = CURDATE() AND estado = 'PAGADO'`
+       WHERE ${isLocalToday('created_at')} AND estado = 'PAGADO'`
     );
 
     // Clientes (contamos pedidos únicos por mesa hoy)
     const [[{ clientesHoy }]] = await pool.query(
       `SELECT COUNT(DISTINCT mesa_id) AS clientesHoy
-       FROM pedidos WHERE DATE(created_at) = CURDATE()`
+       FROM pedidos WHERE ${isLocalToday('created_at')}`
     );
 
     // Inventario
@@ -72,12 +73,13 @@ router.get('/reports', verifyRole('admin', 'supervisor'), async (req, res) => {
   const days = requestedDays;
   const startOffset = days - 1;
   const previousStartOffset = (days * 2) - 1;
-  const currentPaymentRange = `pg.created_at >= DATE_SUB(CURDATE(), INTERVAL ${startOffset} DAY)
-    AND pg.created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)`;
-  const previousPaymentRange = `pg.created_at >= DATE_SUB(CURDATE(), INTERVAL ${previousStartOffset} DAY)
-    AND pg.created_at < DATE_SUB(CURDATE(), INTERVAL ${startOffset} DAY)`;
-  const currentOrderRange = `p.created_at >= DATE_SUB(CURDATE(), INTERVAL ${startOffset} DAY)
-    AND p.created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)`;
+  // Rangos en días del local (Ecuador), no en días UTC de la base.
+  const currentPaymentRange = `pg.created_at >= ${localDaysAgo(startOffset)}
+    AND pg.created_at < ${localTomorrow()}`;
+  const previousPaymentRange = `pg.created_at >= ${localDaysAgo(previousStartOffset)}
+    AND pg.created_at < ${localDaysAgo(startOffset)}`;
+  const currentOrderRange = `p.created_at >= ${localDaysAgo(startOffset)}
+    AND p.created_at < ${localTomorrow()}`;
 
   try {
     const [summaryResult, previousResult, timelineResult, methodsResult, channelsResult, productsResult, hoursResult, cancellationResult] = await Promise.all([
@@ -89,7 +91,7 @@ router.get('/reports', verifyRole('admin', 'supervisor'), async (req, res) => {
         FROM pagos pg WHERE ${currentPaymentRange}`),
       pool.query(`SELECT COALESCE(SUM(pg.monto), 0) AS ventas_netas
         FROM pagos pg WHERE COALESCE(pg.estado, 'ACTIVO') = 'ACTIVO' AND ${previousPaymentRange}`),
-      pool.query(`SELECT DATE_FORMAT(DATE(pg.created_at), '%Y-%m-%d') AS fecha,
+      pool.query(`SELECT DATE_FORMAT(${localDate('pg.created_at')}, '%Y-%m-%d') AS fecha,
         COALESCE(SUM(CASE WHEN COALESCE(pg.estado, 'ACTIVO') = 'ACTIVO' THEN pg.monto ELSE 0 END), 0) AS ventas,
         COUNT(DISTINCT CASE WHEN COALESCE(pg.estado, 'ACTIVO') = 'ACTIVO' THEN pg.pedido_id END) AS pedidos
         FROM pagos pg WHERE ${currentPaymentRange}
@@ -133,7 +135,7 @@ router.get('/reports', verifyRole('admin', 'supervisor'), async (req, res) => {
       period: {
         days,
         from: timelineResult[0][0]?.fecha || null,
-        to: new Date().toISOString().slice(0, 10),
+        to: localTodayISO(),
       },
       summary: {
         net_sales: netSales,

@@ -14,8 +14,9 @@ export function verifyPrintAgent(req, res, next) {
   next();
 }
 
-router.get('/estado', verifyToken, verifyRole('admin', 'cocina', 'mesero', 'caja'), async (_req, res) => {
-  try { res.json(await printQueueStatus()); }
+router.get('/estado', verifyToken, verifyRole('admin', 'cocina', 'mesero', 'caja', 'supervisor'), async (req, res) => {
+  const modulo = req.query.modulo === 'caja' ? 'caja' : 'cocina';
+  try { res.json(await printQueueStatus(modulo)); }
   catch (error) { res.status(503).json({ message: error.message }); }
 });
 
