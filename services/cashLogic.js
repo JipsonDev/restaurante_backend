@@ -23,7 +23,8 @@ export function validateMethod(method) {
 
 export function expectedCash(initial, totals) {
   // Reversed payments are already excluded from active sales. Never deduct them again.
-  return [initial, totals.efectivo, totals.ingresos_efectivo, -Number(totals.retiros_efectivo || 0), -Number(totals.gastos_efectivo || 0)]
+  // Las propinas en efectivo también están en el cajón (hasta entregarlas a los meseros).
+  return [initial, totals.efectivo, totals.ingresos_efectivo, totals.propinas_efectivo, -Number(totals.retiros_efectivo || 0), -Number(totals.gastos_efectivo || 0)]
     .reduce((cents, value) => cents + Math.round(Number(value || 0) * 100), 0) / 100;
 }
 
@@ -32,7 +33,9 @@ export function receiptTotals(order, percent = 0) {
   const totalCents = Math.round(Number(order.total || 0) * 100);
   const itemsCents = (order.items || []).reduce((sum, item) => sum + Math.round((Number(item.precio || 0) +
     (item.modificadores || []).reduce((extra, mod) => extra + Number(mod.precio_extra || 0), 0)) * 100) * Number(item.cantidad || 0), 0);
-  const serviceCents = Math.max(0, totalCents - itemsCents);
+  // Descuentos y cortesías bajan la parte de productos; el servicio es lo que queda.
+  const productCents = Math.max(0, itemsCents - Math.round(Number(order.ajustes_base || 0) * 100));
+  const serviceCents = Math.max(0, totalCents - productCents);
   const subtotalCents = Math.round((totalCents - serviceCents) / (1 + rate));
   return { subtotal: subtotalCents / 100, tax: (totalCents - serviceCents - subtotalCents) / 100,
     service: serviceCents / 100, total: totalCents / 100, taxPercent: rate * 100 };

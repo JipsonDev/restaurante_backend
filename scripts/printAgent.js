@@ -20,7 +20,7 @@ if (process.argv.includes('--check')) {
     tokenConfigured: Boolean(token), printers: await listSystemPrinters() }, null, 2));
 } else {
   if (!token) throw new Error('Configura PRINT_AGENT_TOKEN con el mismo secreto del servidor.');
-  const run = createPrintRunner({ outputDir, mode, printer, command: process.env.PRINT_COMMAND || '', args });
+  const run = createPrintRunner({ outputDir, mode, printer, command: process.env.PRINT_COMMAND || '', args, drawer: process.env.PRINT_DRAWER !== 'off' });
   const api = async (route, body) => {
     const response = await fetch(`${serverUrl}/api/impresiones${route}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-print-token': token },
@@ -53,5 +53,6 @@ if (process.argv.includes('--check')) {
     }
   }
   socket.on('print:comanda', () => { if (modulo === 'cocina') poll(); });
+  socket.on('print:wake', (event = {}) => { if (event.modulo === modulo) poll(); });
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { clearInterval(timer); socket.close(); });
 }
