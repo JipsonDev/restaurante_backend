@@ -6,6 +6,7 @@ import { EVENTS } from '../realtime.js';
 import { emitMesaRealtime, getMesaPayload, listMesas } from '../services/tableState.js';
 import { safeLogAudit } from '../services/audit.js';
 
+import { tableToken } from '../services/publicMenu.js';
 const router = express.Router();
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const eventForTableState = state => state === 'Ocupada' ? EVENTS.TABLE_OCCUPIED : state === 'Libre' ? EVENTS.TABLE_FREED : EVENTS.TABLE_UPDATED;
@@ -53,6 +54,13 @@ async function audit(req, action, id) {
 router.get('/', async (req, res) => {
   try { res.json(await listMesas({ includeInactive: req.query.includeInactive === '1' })); }
   catch (error) { sendError(res, error); }
+});
+// Códigos para imprimir el QR del menú de cada mesa.
+router.get('/qr', verifyRole('admin'), async (_req, res) => {
+  try {
+    const mesas = await listMesas();
+    res.json(mesas.map(m => ({ id: m.id, numero: m.numero, ubicacion: m.ubicacion_nombre || null, codigo: tableToken(m.id) })));
+  } catch (error) { sendError(res, error); }
 });
 router.post('/', verifyRole('admin'), async (req, res) => {
   const inputError = tableInputError(req.body, true);

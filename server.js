@@ -22,6 +22,7 @@ import auditoriaRoutes from './routes/auditoria.js';
 import configuracionRoutes from './routes/configuracion.js';
 import revisionDatosRoutes from './routes/revisionDatos.js';
 import impresionesRoutes from './routes/impresiones.js';
+import publicoRoutes from './routes/publico.js';
 import reservasRoutes, { ensureReservationsTable } from './routes/reservas.js';
 import { ensurePrintQueue } from './services/printQueue.js';
 import { verifyToken, JWT_SECRET } from './middleware/auth.js';
@@ -86,6 +87,7 @@ app.use('/api/configuracion', verifyToken, configuracionRoutes);
 app.use('/api/revision-datos', verifyToken, revisionDatosRoutes);
 app.use('/api/reservas', verifyToken, reservasRoutes);
 app.use('/api/impresiones', impresionesRoutes);
+app.use('/api/publico', publicoRoutes); // menú del QR: sin sesión, solo lectura
 
 const PORT = process.env.PORT || 3000;
 // Una sola intercalación en toda la base (evita «Illegal mix of collations»). No detiene el arranque.
