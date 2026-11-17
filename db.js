@@ -25,6 +25,8 @@ export const pool = mysql.createPool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
+  // Misma intercalación en la conexión que en las tablas (utf8mb4_unicode_ci).
+  charset: 'UTF8MB4_UNICODE_CI',
   ssl: getSslConfig(),
   waitForConnections: true,
   connectionLimit: 10,

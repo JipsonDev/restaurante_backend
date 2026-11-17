@@ -728,6 +728,74 @@ router.get('/:id/seguimiento', verifyRole('admin','mesero','caja'), async (req,r
   } catch { res.status(500).json({message:'No se pudo consultar el seguimiento del pedido.'}); }
 });
 
+// ── Mantenimiento: cuentas abandonadas ──────────────────────────────────────
+// Cuentas abiertas sin actividad desde hace N días (por defecto 15), normalmente pedidos de prueba
+// que dejan mesas ocupadas y ensucian los reportes. Solo admin. Primero se listan; cerrarlas las
+// marca como CANCELADO (no se borran) con la misma lógica que una cancelación normal: libera la
+// mesa, las reservas y el inventario. Las cuentas con pagos registrados se excluyen (se resuelven en caja).
+const staleDays = value => Math.min(365, Math.max(3, Math.floor(Number(value) || 15)));
+async function listStaleOrders(db, days) {
+  const [rows] = await db.query(
+    `SELECT * FROM (
+       SELECT p.id, p.mesa_id, m.numero AS mesa_numero, p.tipo, p.cliente_nombre, p.estado, p.total, p.created_at,
+              GREATEST(p.created_at, COALESCE((SELECT MAX(r.created_at) FROM pedido_rondas r WHERE r.pedido_id = p.id), p.created_at)) AS ultima_actividad,
+              (SELECT COALESCE(SUM(pg.monto), 0) FROM pagos pg WHERE pg.pedido_id = p.id AND COALESCE(pg.estado, 'ACTIVO') = 'ACTIVO') AS abonado
+       FROM pedidos p
+       LEFT JOIN mesas m ON m.id = p.mesa_id
+       WHERE p.estado NOT IN ('PAGADO', 'CANCELADO')
+         AND p.created_at < DATE_SUB(NOW(), INTERVAL ? DAY)
+     ) abandonados
+     WHERE ultima_actividad < DATE_SUB(NOW(), INTERVAL ? DAY)
+     ORDER BY ultima_actividad ASC
+     LIMIT 500`,
+    [days, days]
+  );
+  return rows.map(r => ({ ...r, total: Number(r.total || 0), abonado: Number(r.abonado || 0), cerrable: Number(r.abonado || 0) <= 0 }));
+}
+
+router.get('/mantenimiento/abandonados', verifyRole('admin'), async (req, res) => {
+  try {
+    const days = staleDays(req.query.dias);
+    const items = await listStaleOrders(pool, days);
+    res.json({ dias: days, items, cerrables: items.filter(i => i.cerrable).length, con_pagos: items.filter(i => !i.cerrable).length });
+  } catch (error) {
+    res.status(500).json({ message: 'No se pudieron revisar las cuentas abandonadas.', detail: error.message });
+  }
+});
+
+router.post('/mantenimiento/abandonados/cerrar', verifyRole('admin'), async (req, res) => {
+  const days = staleDays(req.body?.dias);
+  const ids = Array.isArray(req.body?.ids) ? [...new Set(req.body.ids.map(Number).filter(n => Number.isInteger(n) && n > 0))].slice(0, 500) : [];
+  if (!ids.length) return res.status(400).json({ message: 'Elige al menos una cuenta.' });
+  // Se vuelve a comprobar en el servidor: solo se cierran las que siguen abandonadas y sin pagos.
+  const allowed = new Set((await listStaleOrders(pool, days)).filter(o => o.cerrable).map(o => Number(o.id)));
+  const closed = []; const skipped = []; const freedTables = [];
+  for (const id of ids) {
+    if (!allowed.has(id)) { skipped.push({ id, motivo: 'Ya no está abandonada o tiene pagos.' }); continue; }
+    const conn = await pool.getConnection();
+    try {
+      await beginAccountTransaction(conn);
+      const transition = await transitionPedido(conn, id, 'CANCELADO', { allowShortcut: true });
+      await safeLogAudit({
+        conn, user: req.user, accion: 'pedido.cerrado_por_limpieza', entidad: 'pedido', entidadId: id,
+        descripcion: `Cuenta abandonada (más de ${days} días sin actividad) marcada como cancelada`,
+        metadata: { ...transition, dias: days },
+      });
+      await conn.commit();
+      closed.push(id);
+      if (transition.table_freed && transition.mesa_id) freedTables.push(transition.mesa_id);
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      skipped.push({ id, motivo: error.message });
+    } finally {
+      conn.release();
+    }
+  }
+  for (const id of closed) emitRealtime(EVENTS.ORDER_UPDATED, { pedido_id: id, action: 'cancel' });
+  for (const mesa of [...new Set(freedTables)]) await emitTableFreed(mesa).catch(() => {});
+  res.json({ message: closed.length ? `${closed.length} ${closed.length === 1 ? 'cuenta cerrada' : 'cuentas cerradas'}.` : 'No se cerró ninguna cuenta.', cerradas: closed, omitidas: skipped });
+});
+
 router.get('/:id', async (req, res) => {
   try {
     const pedido = await getPedidoCompleto(req.params.id);
