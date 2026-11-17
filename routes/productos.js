@@ -8,6 +8,8 @@ import multer from 'multer';
 import { pool } from '../db.js';
 import { verifyRole } from '../middleware/auth.js';
 import { safeLogAudit } from '../services/audit.js';
+import { cleanStation } from '../services/kitchenFlow.js';
+import { emitRealtime, EVENTS } from '../realtime.js';
 
 const router = express.Router();
 const uploadDir = path.join(process.cwd(), 'uploads', 'productos');
@@ -167,6 +169,24 @@ router.put('/:id/receta', verifyRole('admin'), async (req, res) => {
   } finally { conn.release(); }
 });
 
+// Agotado (por cocina o admin): el producto sigue en el menú del mesero, marcado «Agotado», y el
+// servidor rechaza pedidos nuevos de él hasta que se vuelva a habilitar. No toca el stock ni la
+// publicación (disponible), que siguen siendo cosa del admin.
+router.put('/:id/agotado', verifyRole('admin', 'cocina'), async (req, res) => {
+  const agotado = req.body?.agotado === true || req.body?.agotado === 1 || req.body?.agotado === '1';
+  try {
+    const [[before]] = await pool.query('SELECT id, nombre, agotado FROM productos WHERE id = ?', [req.params.id]);
+    if (!before) return res.status(404).json({ message: 'Producto no encontrado.' });
+    await pool.query('UPDATE productos SET agotado = ? WHERE id = ?', [agotado ? 1 : 0, req.params.id]);
+    await safeLogAudit({ user: req.user, accion: agotado ? 'producto.agotado' : 'producto.habilitado', entidad: 'producto', entidadId: Number(req.params.id),
+      descripcion: `${before.nombre} ${agotado ? 'marcado como agotado' : 'disponible otra vez'}`, metadata: { por_rol: req.user?.rol } });
+    emitRealtime(EVENTS.CATALOG_UPDATED, { producto_id: Number(req.params.id), nombre: before.nombre, agotado });
+    res.json({ id: Number(req.params.id), nombre: before.nombre, agotado });
+  } catch (error) {
+    res.status(500).json({ message: 'No se pudo cambiar el producto.', detail: error.message });
+  }
+});
+
 router.get('/:id', async (req, res) => {
   try {
     const [rows] = await pool.query('SELECT * FROM productos WHERE id = ?', [req.params.id]);
@@ -198,6 +218,7 @@ router.post('/', verifyRole('admin'), async (req, res) => {
       [categoria_id, inventario_item_id, cleanName, descripcion || null, Number(precio), Number(stock), imagen_url, Number(disponible)]
     );
     if (receta !== null) await replaceRecipe(conn, result.insertId, receta);
+    if (Object.hasOwn(req.body, 'estacion')) await conn.query('UPDATE productos SET estacion = ? WHERE id = ?', [cleanStation(req.body.estacion), result.insertId]);
     await conn.commit();
     await safeLogAudit({
       user: req.user,
@@ -276,6 +297,7 @@ router.put('/:id', verifyRole('admin'), async (req, res) => {
     );
     if (!updated.affectedRows) { await conn.rollback(); return res.status(409).json({ message: 'No puedes reducir el stock por debajo de las reservas de pedidos confirmados.' }); }
     if (receta !== null) await replaceRecipe(conn, req.params.id, receta);
+    if (Object.hasOwn(req.body, 'estacion')) await conn.query('UPDATE productos SET estacion = ? WHERE id = ?', [cleanStation(req.body.estacion), req.params.id]);
     const [[after]] = await conn.query('SELECT * FROM productos WHERE id = ? FOR UPDATE', [req.params.id]);
     await conn.commit();
     const priceChanged = precio !== undefined && Number(before.precio) !== Number(precio);
