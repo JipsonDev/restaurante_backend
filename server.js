@@ -28,6 +28,7 @@ import { attachSocketAuth } from './services/socketAuth.js';
 import { resolveCorsOrigins, securityHeaders, trustProxySetting } from './services/httpSecurity.js';
 import { setRealtimeServer } from './realtime.js';
 import { ensureAuditTable } from './services/audit.js';
+import { unifyCollation } from './services/collation.js';
 import { ensureBusinessConfigTable } from './services/businessConfig.js';
 
 dotenv.config();
@@ -85,6 +86,12 @@ app.use('/api/reservas', verifyToken, reservasRoutes);
 app.use('/api/impresiones', impresionesRoutes);
 
 const PORT = process.env.PORT || 3000;
+// Una sola intercalación en toda la base (evita «Illegal mix of collations»). No detiene el arranque.
+try {
+  await unifyCollation();
+} catch (error) {
+  console.warn('No se pudo revisar la intercalación de la base:', error.message);
+}
 try {
   await ensureAuditTable();
   await ensureBusinessConfigTable();

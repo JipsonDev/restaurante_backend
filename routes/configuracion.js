@@ -6,6 +6,7 @@ import { verifyRole } from '../middleware/auth.js';
 import { getBusinessConfig, setBusinessConfig } from '../services/businessConfig.js';
 import { listSystemPrinters } from '../services/printers.js';
 import { safeLogAudit } from '../services/audit.js';
+import { collationReport, unifyCollation } from '../services/collation.js';
 
 const router = express.Router();
 const uploadDir = path.join(process.cwd(), 'uploads', 'configuracion');
@@ -103,6 +104,19 @@ router.post('/logo', verifyRole('admin'), upload.single('logo'), async (req, res
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// Mantenimiento de la base: estado de la intercalación y reintento manual (solo admin).
+router.get('/mantenimiento/base', verifyRole('admin'), async (_req, res) => {
+  try { res.json(await collationReport()); }
+  catch (error) { res.status(500).json({ message: 'No se pudo revisar la base de datos.', detail: error.message }); }
+});
+router.post('/mantenimiento/base', verifyRole('admin'), async (req, res) => {
+  try {
+    const result = await unifyCollation();
+    await safeLogAudit({ user: req.user, accion: 'base.intercalacion_unificada', entidad: 'configuracion', descripcion: 'Unificación de intercalación', metadata: result });
+    res.json({ ...result, report: await collationReport() });
+  } catch (error) { res.status(500).json({ message: 'No se pudo unificar la intercalación.', detail: error.message }); }
 });
 
 export default router;
