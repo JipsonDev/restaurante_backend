@@ -50,11 +50,15 @@ const corsOptions = {
   credentials: allowedOrigins !== '*',
 };
 const httpServer = http.createServer(app);
+// Celulares y tablets se duermen o pasan a segundo plano: con 20 s de margen se cortaban a cada rato.
+// 25 s entre latidos y 60 s de espera toleran pantallas bloqueadas y wifi irregular; y tras un corte corto
+// (hasta 2 min) el cliente recupera los eventos que se perdió en lugar de empezar de cero.
 const io = new Server(httpServer, {
   cors: corsOptions,
-  pingInterval: 10000,
-  pingTimeout: 20000,
+  pingInterval: 25000,
+  pingTimeout: 60000,
   maxHttpBufferSize: 1e5,
+  connectionStateRecovery: { maxDisconnectionDuration: 2 * 60 * 1000, skipMiddlewares: true },
 });
 
 attachSocketAuth(io, () => ({ jwtSecret: JWT_SECRET, printToken: process.env.PRINT_AGENT_TOKEN }));
