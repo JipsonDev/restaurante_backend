@@ -6,6 +6,7 @@ const LIMITS = {
   telefono: 40,
   correo: 160,
   logo_url: 500,
+  color_marca: 7,
   iva_porcentaje: 7,
   servicio_porcentaje: 7,
   moneda: 3,
@@ -71,6 +72,11 @@ export function normalizeBusinessConfigPatch(values = {}, allowedKeys = Object.k
       const phone = text(value, 'El teléfono', LIMITS[key]);
       if (phone && phone.replace(/\D/g, '').length < 7) throw configError('El teléfono debe contener al menos 7 dígitos.');
       result[key] = phone;
+    } else if (key === 'color_marca') {
+      // Color principal del local (marca blanca): #RRGGBB, o vacío para el color del producto.
+      const color = String(value ?? '').trim();
+      if (color && !/^#[0-9a-f]{6}$/i.test(color)) throw configError('El color de marca debe ser un código como #D63B20.');
+      result[key] = color.toUpperCase();
     } else if (key === 'logo_url') {
       const url = text(value, 'La URL del logo', LIMITS[key]);
       if (url && !/^\/uploads\//i.test(url) && !/^https?:\/\//i.test(url)) throw configError('El logo debe ser una URL http(s) o una imagen cargada en el sistema.');

@@ -25,7 +25,7 @@ router.get('/menu', async (req, res) => {
     ]);
     res.set('Cache-Control', 'public, max-age=60');
     res.json({
-      negocio: { nombre: config.nombre_restaurante || 'Restaurante', logo_url: config.logo_url || null, telefono: config.telefono || null, direccion: config.direccion || null, simbolo: config.simbolo_moneda || '$' },
+      negocio: { nombre: config.nombre_restaurante || 'Restaurante', logo_url: config.logo_url || null, telefono: config.telefono || null, direccion: config.direccion || null, simbolo: config.simbolo_moneda || '$', color_marca: config.color_marca || null },
       mesa: mesaRows[0]?.[0] ? { numero: mesaRows[0][0].numero } : null,
       ...publicMenu(rows),
     });
