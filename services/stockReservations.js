@@ -54,7 +54,7 @@ export async function reserveRoundStock(conn, roundId, { legacy = false } = {}) 
     const [[resource]] = await conn.query(`SELECT id, nombre, stock, stock_reservado FROM ${table} WHERE id = ? FOR UPDATE`, [need.recurso_id]);
     if (!resource) throw fail('No existe un recurso de inventario de la receta.');
     const free = milli(resource.stock) - milli(resource.stock_reservado);
-    if (!legacy && free < need.units) throw fail(`Sin stock suficiente de ${resource.nombre}. Disponible para vender: ${Math.max(0, qty(free))}; requerido: ${qty(need.units)}.`);
+    if (!legacy && free < need.units) throw fail(`No alcanza ${resource.nombre} para esta ronda: quedan ${Math.max(0, qty(free)).toLocaleString('es-EC')} y se necesitan ${qty(need.units).toLocaleString('es-EC')}. Quita el plato o avisa para reponer.`);
     await conn.query(`UPDATE ${table} SET stock_reservado = stock_reservado + ? WHERE id = ?`, [qty(need.units), need.recurso_id]);
     await conn.query('INSERT INTO stock_reservas (ronda_id, tipo, recurso_id, cantidad) VALUES (?, ?, ?, ?)', [roundId, need.tipo, need.recurso_id, qty(need.units)]);
   }

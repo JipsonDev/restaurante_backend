@@ -17,7 +17,8 @@ import cajaRoutes, { initializeCashSchema } from './routes/caja.js';
 import inventarioRoutes from './routes/inventario.js';
 import ubicacionesRoutes from './routes/ubicaciones.js';
 import extrasRoutes from './routes/extras.js';
-import notificacionesRoutes from './routes/notificaciones.js';
+import notificacionesRoutes, { sendPushToRoles } from './routes/notificaciones.js';
+import { startStockWatch } from './services/stockWatch.js';
 import auditoriaRoutes from './routes/auditoria.js';
 import configuracionRoutes from './routes/configuracion.js';
 import revisionDatosRoutes from './routes/revisionDatos.js';
@@ -49,11 +50,15 @@ const corsOptions = {
   credentials: allowedOrigins !== '*',
 };
 const httpServer = http.createServer(app);
+// Celulares y tablets se duermen o pasan a segundo plano: con 20 s de margen se cortaban a cada rato.
+// 25 s entre latidos y 60 s de espera toleran pantallas bloqueadas y wifi irregular; y tras un corte corto
+// (hasta 2 min) el cliente recupera los eventos que se perdió en lugar de empezar de cero.
 const io = new Server(httpServer, {
   cors: corsOptions,
-  pingInterval: 10000,
-  pingTimeout: 20000,
+  pingInterval: 25000,
+  pingTimeout: 60000,
   maxHttpBufferSize: 1e5,
+  connectionStateRecovery: { maxDisconnectionDuration: 2 * 60 * 1000, skipMiddlewares: true },
 });
 
 attachSocketAuth(io, () => ({ jwtSecret: JWT_SECRET, printToken: process.env.PRINT_AGENT_TOKEN }));
@@ -112,6 +117,9 @@ await ensureStockReservations();
 const reservations = await migratePendingReservations();
 if (reservations.shortages.length) console.warn('Inventario comprometido por pedidos anteriores: requiere reposicion', reservations.shortages);
 if (reservations.migrated) console.log(`Reservas creadas para ${reservations.migrated} rondas anteriores.`);
+// Vigilante de stock: «queda poco» y agotado automático (avisa a administración en pantalla y al teléfono).
+startStockWatch({ onAlert: (message) => sendPushToRoles(['admin', 'supervisor'], { title: message.title, body: message.body, tag: 'inventario', kind: 'stock', ttl: 3600, urgency: 'normal', data: { type: 'INVENTORY_ALERT' } }) });
+
 httpServer.listen(PORT, () => {
   console.log(`Servidor corriendo en http://localhost:${PORT}`);
 });

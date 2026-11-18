@@ -6,12 +6,19 @@ import fs from 'fs';
 import path from 'path';
 import multer from 'multer';
 import { pool } from '../db.js';
+import { scheduleStockCheck } from '../services/stockWatch.js';
 import { verifyRole } from '../middleware/auth.js';
 import { safeLogAudit } from '../services/audit.js';
 import { cleanStation } from '../services/kitchenFlow.js';
 import { emitRealtime, EVENTS } from '../realtime.js';
 
 const router = express.Router();
+
+// Cualquier cambio que salga bien (entrada, ajuste, receta, producto) puede cambiar lo que se puede vender.
+router.use((req, res, next) => {
+  if (req.method !== 'GET') res.on('finish', () => { if (res.statusCode < 400) scheduleStockCheck(); });
+  next();
+});
 const uploadDir = path.join(process.cwd(), 'uploads', 'productos');
 
 fs.mkdirSync(uploadDir, { recursive: true });

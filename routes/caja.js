@@ -580,7 +580,7 @@ router.post('/imprimir', verifyRole('admin', 'supervisor', 'caja'), async (req, 
     const caja = soloCajon ? await lockCashRegister(conn) : null;
     if (soloCajon && !caja) throw paymentError('Abre la caja antes de abrir el cajón.', 409);
     const job = await enqueuePrint(conn, { modulo: 'caja', pedido_id: Number(req.body.pedido_id) || 0, pago_id: Number(req.body.pago_id) || null,
-      titulo: String(req.body.titulo || 'Comprobante').slice(0, 80), texto, abrir_cajon: req.body.abrir_cajon === true || soloCajon, solo_cajon: soloCajon,
+      titulo: String(req.body.titulo || 'Comprobante').slice(0, 80), texto, texto_marcado: String(req.body.texto_marcado || '').slice(0, 24000) || null, abrir_cajon: req.body.abrir_cajon === true || soloCajon, solo_cajon: soloCajon,
       logo_url: req.body.logo_url || null });
     if (soloCajon) await safeLogAudit({ conn, user: req.user, accion: 'caja.cajon_abierto', entidad: 'caja', entidadId: Number(caja.id),
       descripcion: `Cajón abierto sin venta: ${String(req.body.motivo || 'sin motivo').slice(0, 120)}`, metadata: { motivo: req.body.motivo || null } });
@@ -782,6 +782,24 @@ router.post('/cobrar', requirePermission('cash_charge'), async (req, res) => {
   } finally {
     if (conn) conn.release();
   }
+});
+
+// Cobro que la caja envió pero cuya respuesta no llegó (se cortó la conexión): ¿se registró o no?
+// Así la caja puede limpiar el aviso sola en vez de quedarse con «cobro sin confirmar».
+router.get('/cobro-pendiente/:key', requirePermission('cash_charge'), async (req, res) => {
+  const key = String(req.params.key || '');
+  if (!/^[A-Za-z0-9_-]{16,80}$/.test(key)) return res.status(400).json({ message: 'Identificador de cobro invalido.' });
+  try {
+    await ensurePaymentFields();
+    const [[pago]] = await pool.query('SELECT id, pedido_id, estado, monto, comprobante_numero, motivo_anulacion, comprobante_snapshot FROM pagos WHERE idempotency_key = ? LIMIT 1', [key]);
+    if (pago) {
+      return res.json({ registrado: true, pago_id: pago.id, pago: { id: pago.id, estado: pago.estado, motivo_anulacion: pago.motivo_anulacion },
+        monto: Number(pago.monto), comprobante_numero: pago.comprobante_numero, snapshot: parseSnapshot(pago.comprobante_snapshot), pedido_id: pago.pedido_id });
+    }
+    const pedidoId = Number(req.query.pedido_id) || 0;
+    const [[pedido]] = pedidoId ? await pool.query('SELECT id, estado FROM pedidos WHERE id = ? LIMIT 1', [pedidoId]) : [[null]];
+    res.json({ registrado: false, pedido_estado: pedido?.estado || null });
+  } catch (error) { res.status(500).json({ message: error.message }); }
 });
 
 router.post('/movimientos', requirePermission('cash_movements'), async (req, res) => {

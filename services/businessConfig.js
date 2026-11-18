@@ -9,6 +9,7 @@ const DEFAULT_CONFIG = {
   telefono: '',
   correo: '',
   logo_url: '',
+  color_marca: '',
   iva_porcentaje: '16',
   servicio_porcentaje: '0',
   moneda: 'USD',
