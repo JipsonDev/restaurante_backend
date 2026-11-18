@@ -416,7 +416,8 @@ test('manual printing a round contains only its products and its round number', 
   queued = [];
   const result = await request('post', '/:id/imprimir-comanda', { ronda_id: 31 });
   assert.equal(result.statusCode, 202);
-  assert.match(queued[0].payload.texto, /RONDA #31/);
+  assert.match(queued[0].payload.texto, /Ronda #31/i);
+  assert.match(queued[0].payload.texto_marcado, /\u001fT/);
   assert.match(queued[0].payload.texto, /Postre/);
   assert.doesNotMatch(queued[0].payload.texto, /Plato anterior/);
 });

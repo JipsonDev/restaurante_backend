@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { parseTicket } from './ticketLayout.js';
 
 const execute = promisify(execFile);
 
@@ -45,10 +46,28 @@ export function encodeCp850(text) {
   }
   return out;
 }
-export function escposTicket({ texto = '', abrir_cajon = false, solo_cajon = false } = {}, { drawer = true } = {}) {
+// Estilos por línea (ticketLayout): T título doble ancho+alto · H doble alto · C centrado · c centrado negrita · B negrita.
+const STYLE_ON = {
+  T: [ESC, 0x61, 0x01, GS, 0x21, 0x11, ESC, 0x45, 0x01],
+  H: [GS, 0x21, 0x01, ESC, 0x45, 0x01],
+  C: [ESC, 0x61, 0x01],
+  c: [ESC, 0x61, 0x01, ESC, 0x45, 0x01],
+  B: [ESC, 0x45, 0x01],
+};
+const STYLE_OFF = [GS, 0x21, 0x00, ESC, 0x45, 0x00, ESC, 0x61, 0x00];
+export function encodeStyled(markup) {
+  const out = [];
+  for (const { style, text } of parseTicket(markup)) {
+    if (style && STYLE_ON[style]) out.push(...STYLE_ON[style], ...encodeCp850(text), 0x0a, ...STYLE_OFF);
+    else out.push(...encodeCp850(text), 0x0a);
+  }
+  return out;
+}
+export function escposTicket({ texto = '', texto_marcado = '', abrir_cajon = false, solo_cajon = false } = {}, { drawer = true } = {}) {
   const bytes = [ESC, 0x40, ESC, 0x74, 0x02]; // inicializar + página de códigos 850
   if (drawer && (abrir_cajon || solo_cajon)) bytes.push(...DRAWER_PULSE);
-  if (!solo_cajon) bytes.push(...encodeCp850(texto), 0x0a, 0x0a, 0x0a, 0x0a, GS, 0x56, 0x42, 0x03); // texto, avance y corte parcial
+  // Con texto_marcado se imprime con estilos; si no (trabajos antiguos), el texto plano de siempre.
+  if (!solo_cajon) bytes.push(...(texto_marcado ? encodeStyled(texto_marcado) : [...encodeCp850(texto), 0x0a]), 0x0a, 0x0a, 0x0a, GS, 0x56, 0x42, 0x03); // avance y corte parcial
   return Buffer.from(bytes);
 }
 

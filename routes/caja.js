@@ -580,7 +580,7 @@ router.post('/imprimir', verifyRole('admin', 'supervisor', 'caja'), async (req, 
     const caja = soloCajon ? await lockCashRegister(conn) : null;
     if (soloCajon && !caja) throw paymentError('Abre la caja antes de abrir el cajón.', 409);
     const job = await enqueuePrint(conn, { modulo: 'caja', pedido_id: Number(req.body.pedido_id) || 0, pago_id: Number(req.body.pago_id) || null,
-      titulo: String(req.body.titulo || 'Comprobante').slice(0, 80), texto, abrir_cajon: req.body.abrir_cajon === true || soloCajon, solo_cajon: soloCajon,
+      titulo: String(req.body.titulo || 'Comprobante').slice(0, 80), texto, texto_marcado: String(req.body.texto_marcado || '').slice(0, 24000) || null, abrir_cajon: req.body.abrir_cajon === true || soloCajon, solo_cajon: soloCajon,
       logo_url: req.body.logo_url || null });
     if (soloCajon) await safeLogAudit({ conn, user: req.user, accion: 'caja.cajon_abierto', entidad: 'caja', entidadId: Number(caja.id),
       descripcion: `Cajón abierto sin venta: ${String(req.body.motivo || 'sin motivo').slice(0, 120)}`, metadata: { motivo: req.body.motivo || null } });

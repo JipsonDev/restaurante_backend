@@ -19,6 +19,7 @@ import { sendPushToUser } from './notificaciones.js';
 import { emitTableFreed, emitTableOccupied, freeMesaIfNoActive, syncTableStates } from '../services/tableState.js';
 import { ensureAuditTable, safeLogAudit } from '../services/audit.js';
 import { getBusinessConfig } from '../services/businessConfig.js';
+import { build, businessHeader, dateTime, docTitle, footer, itemTable, itemTotal, money, t, toPlain } from '../services/ticketLayout.js';
 import { normalizeRole } from '../services/permissions.js';
 import { loadOrderTracking, migrateRoundAttribution } from '../services/orderTracking.js';
 import { listDelayAlerts, claimDelayAlerts, migrateServiceAlerts } from '../services/serviceAlerts.js';
@@ -319,158 +320,59 @@ async function notifyWaiterOrderReady(pedido, { manual = false, rondaId = null }
   });
 }
 
-function ticketDateParts(value) {
-  const date = new Date(value || Date.now());
-  const two = (n) => String(n).padStart(2, '0');
-  return {
-    fecha: `${two(date.getDate())}/${two(date.getMonth() + 1)}/${date.getFullYear()}`,
-    hora: date.toLocaleTimeString('es-EC', { hour: '2-digit', minute: '2-digit' }),
-  };
-}
 
-function ticketHelpers(width = 42) {
-  return {
-    line: '-'.repeat(width),
-    center: (text) => {
-      const value = String(text || '');
-      const left = Math.max(0, Math.floor((width - value.length) / 2));
-      return `${' '.repeat(left)}${value}`;
-    },
-    cut: (text, len) => String(text || '').slice(0, len),
-  };
-}
 
-function kitchenItemRows(pedido, nameWidth = 24) {
-  const { cut } = ticketHelpers();
-  return (pedido.items || []).flatMap((item) => {
-    const observaciones = [
-      item.notas,
-      ...(item.modificadores || []).map((mod) => {
-        const prefix = mod.tipo === 'EXTRA' ? '+' : mod.tipo === 'EXCLUSION' ? 'Sin' : '';
-        return `${prefix} ${mod.nombre}`.trim();
-      }),
-    ].filter(Boolean).join(', ');
-
-    const first = `${String(item.cantidad).padEnd(5)} ${cut(item.nombre, nameWidth).padEnd(nameWidth)} ${cut(observaciones, 10)}`;
-    const extra = [];
-    const name = String(item.nombre || '');
-    for (let offset = nameWidth; offset < name.length; offset += 34) {
-      extra.push(`      ${name.slice(offset, offset + 34)}`);
-    }
-    for (let offset = 10; offset < observaciones.length; offset += 34) {
-      extra.push(`      ${observaciones.slice(offset, offset + 34)}`);
-    }
-    return [first, ...extra];
-  });
-}
-
-function buildKitchenTicket(pedido) {
-  const { fecha, hora } = ticketDateParts(pedido.created_at);
-  const ticket = String(pedido.id || '').padStart(5, '0');
-  const { line, center, cut } = ticketHelpers();
-  const target = pedidoUbicacionLabel(pedido);
-
-  return [
-    center('MORENA MIA'),
-    center('TICKET COCINA'),
-    line,
-    `COMANDA #${ticket}`.padEnd(24) + cut(target.toUpperCase(), 18),
-    `Fecha: ${fecha}`.padEnd(24) + `Hora: ${hora}`,
-    `Mesero: ${cut(pedido.mesero_nombre || '-', 30)}`,
-    pedido.ronda_id ? `RONDA #${pedido.ronda_id}` : '',
-    line,
-    'CANT. PRODUCTO                OBS.',
-    line,
-    ...kitchenItemRows(pedido, 24),
-    line,
-    pedido.notas ? `NOTA GENERAL: ${pedido.notas}` : '',
-    center('USO INTERNO COCINA'),
-  ].filter(Boolean).join('\n');
-}
-
-function buildPickupComanda(pedido) {
-  const date = new Date(pedido.created_at || Date.now());
-  const { fecha, hora } = ticketDateParts(date);
-  const ticket = String(pedido.id || '').padStart(5, '0');
-  const target = pedidoUbicacionLabel(pedido);
-  const customerLines = pickupDetailLines(pedido);
-  const { line, center, cut } = ticketHelpers();
+// ── Tickets impresos (marca blanca) ─────────────────────────────────────
+// Comanda de cocina: destino en grande, platos en doble alto, notas y alergias visibles. Nombre del local
+// desde la configuración (nunca uno fijo). Devuelve el texto con estilos; toPlain() da el plano.
+function comandaMarkup(pedido, settings = {}) {
+  const { fecha, hora } = dateTime(pedido.created_at);
+  const pickup = isPickupOrder(pedido);
   const isDelivery = pedido.tipo === 'Delivery';
-
-  const lines = [
-    center('MORENA MIA'),
-    center(isDelivery ? 'COMANDA DELIVERY' : 'COMANDA PARA LLEVAR'),
-    line,
-    `PEDIDO #${ticket}`.padEnd(24) + cut(target.toUpperCase(), 18),
-    `Fecha: ${fecha}`.padEnd(24) + `Hora: ${hora}`,
-    `Cliente: ${cut(pedido.cliente_nombre || 'Consumidor final', 32)}`,
-    `Mesero: ${cut(pedido.mesero_nombre || '-', 32)}`,
-    ...customerLines,
-    pedido.ronda_id ? `RONDA #${pedido.ronda_id}` : '',
-    line,
-    'CANT. PRODUCTO                OBS.',
-    line,
-    ...kitchenItemRows(pedido, 24),
-    line,
-    pedido.notas ? `NOTA GENERAL: ${pedido.notas}` : '',
-    center(isDelivery ? 'VERIFICAR DATOS DE ENTREGA' : 'ENTREGAR EN MOSTRADOR'),
-  ].filter(Boolean);
-
-  return lines.join('\n');
+  const target = pickup ? `${isDelivery ? 'Delivery' : 'Llevar'}${pedido.cliente_nombre ? ` · ${pedido.cliente_nombre}` : ''}` : pedidoUbicacionLabel(pedido);
+  return build(
+    t.center(settings.nombre_restaurante || ''),
+    t.title(target),
+    t.center([`Pedido #${String(pedido.id || '').padStart(5, '0')}`, pedido.ronda_id ? `Ronda #${pedido.ronda_id}` : null].filter(Boolean).join(' · ')),
+    t.center(`${fecha} ${hora}${pedido.mesero_nombre ? ` · ${pedido.mesero_nombre}` : ''}`),
+    pickup ? pickupDetailLines(pedido).map((l) => t.text(l)) : null,
+    t.rule('='),
+    ...(pedido.items || []).map((item) => [
+      t.big(`${item.cantidad} x ${item.nombre}`, 4),
+      ...(item.modificadores || []).map((mod) => t.text(`${mod.tipo === 'EXTRA' ? '+ ' : mod.tipo === 'EXCLUSION' ? 'SIN ' : ''}${mod.nombre}`, 4)),
+      item.notas ? t.bold(`>> ${item.notas}`, 4) : null,
+    ]),
+    t.rule('-'),
+    pedido.notas ? t.bold(`NOTA: ${pedido.notas}`) : null,
+    pickup ? t.centerBold(isDelivery ? 'VERIFICAR DATOS DE ENTREGA' : 'ENTREGAR EN MOSTRADOR') : null,
+  );
 }
+function buildComanda(pedido, settings) { return toPlain(comandaMarkup(pedido, settings)); }
 
-function buildComanda(pedido) {
-  return isPickupOrder(pedido) ? buildPickupComanda(pedido) : buildKitchenTicket(pedido);
-}
-
-function moneyTicket(value, symbol = '$') {
-  return `${symbol}${Number(value || 0).toFixed(2)}`;
-}
-
-function ticketRow(left, right, width = 42) {
-  const l = String(left || '');
-  const r = String(right || '');
-  const space = Math.max(1, width - l.length - r.length);
-  return `${l}${' '.repeat(space)}${r}`;
-}
-
-function buildPrecuenta(pedido, settings = {}) {
-  const subtotal = pedido.items.reduce((sum, item) => {
-    const extras = (item.modificadores || []).reduce((mSum, mod) => mSum + Number(mod.precio_extra || 0), 0);
-    return sum + (Number(item.precio || 0) + extras) * Number(item.cantidad || 0);
-  }, 0);
+// Pre-cuenta para el cliente: encabezado del local, detalle en columnas y saldo destacado.
+function precuentaMarkup(pedido, settings = {}) {
+  const sym = settings.simbolo_moneda || '$';
+  const subtotal = (pedido.items || []).reduce((sum, item) => sum + itemTotal(item), 0);
   const total = Number(pedido.total || subtotal);
-  const { line, center, cut } = ticketHelpers();
-  const symbol = settings.simbolo_moneda || '$';
-
-  return [
-    center((settings.nombre_restaurante || 'MORENA MIA').toUpperCase()),
-    settings.ruc ? center(`RUC: ${settings.ruc}`) : '',
-    settings.direccion ? center(settings.direccion) : '',
-    settings.telefono ? center(`Tel: ${settings.telefono}`) : '',
-    line,
-    center('TICKET CLIENTE'),
-    center('PRE-CUENTA'),
-    line,
-    ticketRow('Pedido', `#${pedido.id}`),
-    ticketRow('Fecha', new Date().toLocaleString('es-EC')),
-    pedidoUbicacionLabel(pedido),
-    ...pickupDetailLines(pedido),
-    line,
-    ...pedido.items.map((item) => {
-      const extras = (item.modificadores || []).reduce((mSum, mod) => mSum + Number(mod.precio_extra || 0), 0);
-      const label = `${item.cantidad}x ${cut(item.nombre, 24)}`;
-      return ticketRow(label, moneyTicket((Number(item.precio || 0) + extras) * Number(item.cantidad || 0), symbol));
-    }),
-    line,
-    ticketRow('Subtotal', moneyTicket(subtotal, symbol)),
-    ticketRow('Total de cuenta', moneyTicket(total, symbol)),
-    Number(pedido.abonado) > 0 ? ticketRow('Abonos', moneyTicket(pedido.abonado, symbol)) : '',
-    ticketRow('Saldo a pagar', moneyTicket(pedido.saldo_pendiente ?? total, symbol)),
-    line,
-    center('Ticket no fiscal'),
-  ].filter(Boolean).join('\n');
+  const { fecha, hora } = dateTime();
+  return build(
+    businessHeader(settings),
+    docTitle('PRE-CUENTA'),
+    t.row('Fecha', `${fecha} ${hora}`),
+    t.row('Pedido', `#${pedido.id}`),
+    t.row(isPickupOrder(pedido) ? (pedido.tipo === 'Delivery' ? 'Delivery' : 'Para llevar') : 'Mesa', isPickupOrder(pedido) ? (pedido.cliente_nombre || 'Cliente') : String(pedido.mesa_numero || pedido.mesa_id || '-')),
+    pickupDetailLines(pedido).map((l) => t.text(l)),
+    pedido.mesero_nombre ? t.row('Atendió', pedido.mesero_nombre) : null,
+    t.blank(),
+    itemTable(pedido.items || [], sym),
+    t.row('Subtotal', money(subtotal, sym)),
+    t.row('Total de la cuenta', money(total, sym), 'B'),
+    Number(pedido.abonado) > 0 ? t.row('Abonos', money(pedido.abonado, sym)) : null,
+    t.row('SALDO A PAGAR', money(pedido.saldo_pendiente ?? total, sym), 'H'),
+    footer(settings),
+  );
 }
+function buildPrecuenta(pedido, settings) { return toPlain(precuentaMarkup(pedido, settings)); }
 
 async function getPedidoItemsForInventory(conn, pedidoId, detailIds = null) {
   const [items] = await conn.query(
@@ -682,7 +584,7 @@ router.post('/:id/imprimir-comanda', verifyRole('admin', 'cocina', 'mesero'), as
     const settings = await getBusinessConfig();
     const payload = {
       pedido_id: pedido.id, mesa_id: pedido.mesa_id, modulo: 'cocina',
-      plantilla: 'ticket_cocina', texto: buildComanda(printOrder),
+      plantilla: 'ticket_cocina', texto: buildComanda(printOrder, settings), texto_marcado: comandaMarkup(printOrder, settings),
       impresora: settings.impresora_cocina || null,
     };
     const job = await enqueuePrint(pool, payload);
@@ -695,9 +597,11 @@ router.get('/:id/comanda', async (req, res) => {
   try {
     const pedido = await getPedidoCompleto(req.params.id);
     if (!pedido) return res.status(404).json({ message: 'Pedido no encontrado.' });
+    const settings = await getBusinessConfig();
     res.json({
       pedido,
-      texto: buildComanda(pedido),
+      texto: buildComanda(pedido, settings),
+      texto_marcado: comandaMarkup(pedido, settings),
       plantilla: isPickupOrder(pedido) ? 'comanda_pickup' : 'ticket_cocina',
     });
   } catch (error) {
@@ -709,7 +613,8 @@ router.get('/:id/precuenta', async (req, res) => {
   try {
     const pedido = await getPedidoCompleto(req.params.id);
     if (!pedido) return res.status(404).json({ message: 'Pedido no encontrado.' });
-    res.json({ pedido, texto: buildPrecuenta(pedido) });
+    const settings = await getBusinessConfig();
+    res.json({ pedido, texto: buildPrecuenta(pedido, settings), texto_marcado: precuentaMarkup(pedido, settings) });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1050,16 +955,18 @@ router.post('/', verifyRole('admin', 'mesero', 'caja'), async (req, res) => {
       metadata: { ronda_id:rondaId, actor_nombre:req.user.nombre || null, mesa_id: mesaId, tipo: normalizedTipo, cliente_nombre: customerName || null, items: normalizedItems.length, total: finalTotal },
     });
     const pedido = await getPedidoCompleto(pedidoId, conn);
-    const comanda = buildComanda({
+    const comandaOrder = {
       ...pedido, ronda_id: rondaId, notas, created_at: new Date(),
       items: pedido.items.filter((item) => newDetailIds.includes(Number(item.id))),
-    });
+    };
+    const comanda = buildComanda(comandaOrder, businessConfig);
     const printPayload = {
       pedido_id: pedidoId,
       mesa_id: mesaId,
       tipo: isPickupOrder(pedido) ? (pedido.tipo === 'Delivery' ? 'delivery' : 'para-llevar') : 'cocina',
       plantilla: isPickupOrder(pedido) ? 'comanda_pickup' : 'ticket_cocina',
       texto: comanda,
+      texto_marcado: comandaMarkup(comandaOrder, businessConfig),
       impresora: businessConfig.impresora_cocina || null,
       modulo: 'cocina',
     };
@@ -1311,12 +1218,14 @@ router.post('/:id/imprimir-precuenta', verifyRole('admin', 'mesero', 'caja'), as
     const businessConfig = await getBusinessConfig();
     const pedido = await getPedidoCompleto(req.params.id);
     const texto = buildPrecuenta(pedido, businessConfig);
+    const textoMarcado = precuentaMarkup(pedido, businessConfig);
     emitRealtime(EVENTS.PRINT_PRECUENTA, {
       pedido_id: pedido.id,
       mesa_id: pedido.mesa_id,
       tipo: 'cliente',
       plantilla: 'ticket_cliente_precuenta',
       texto,
+      texto_marcado: textoMarcado,
       impresora: businessConfig.impresora_caja || null,
       modulo: 'caja',
     });
