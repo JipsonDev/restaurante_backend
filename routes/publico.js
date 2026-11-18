@@ -4,6 +4,7 @@ import { rateLimit } from 'express-rate-limit';
 import { pool } from '../db.js';
 import { getBusinessConfig } from '../services/businessConfig.js';
 import { parseTableToken, publicMenu } from '../services/publicMenu.js';
+import { sellableStockSQL } from '../services/stockReservations.js';
 
 const router = express.Router();
 router.use(rateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: 'draft-8', legacyHeaders: false,
@@ -15,8 +16,9 @@ router.get('/menu', async (req, res) => {
     const mesaId = parseTableToken(req.query.mesa);
     const [config, [rows], mesaRows] = await Promise.all([
       getBusinessConfig(),
-      pool.query(`SELECT p.id, p.nombre, p.descripcion, p.precio, p.imagen_url, p.agotado, c.nombre AS categoria_nombre
-                    FROM productos p LEFT JOIN categorias c ON c.id = p.categoria_id
+      // Agotado a mano por cocina o sin stock en el inventario: para el cliente es lo mismo.
+      pool.query(`SELECT p.id, p.nombre, p.descripcion, p.precio, p.imagen_url, (p.agotado = 1 OR ${sellableStockSQL} <= 0) AS agotado, c.nombre AS categoria_nombre
+                    FROM productos p LEFT JOIN categorias c ON c.id = p.categoria_id LEFT JOIN inventario_items ii ON ii.id = p.inventario_item_id
                    WHERE p.disponible = 1 AND COALESCE(c.activo, 1) = 1
                    ORDER BY COALESCE(c.nombre, 'ZZZ') ASC, p.nombre ASC`),
       mesaId ? pool.query('SELECT numero FROM mesas WHERE id = ? AND activo = 1', [mesaId]) : Promise.resolve([[]]),

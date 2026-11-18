@@ -1,9 +1,16 @@
 import { nonNegative } from '../services/adminValidation.js';
 import express from 'express';
 import { pool } from '../db.js';
+import { scheduleStockCheck } from '../services/stockWatch.js';
 import { verifyRole } from '../middleware/auth.js';
 
 const router = express.Router();
+
+// Cualquier cambio que salga bien (entrada, ajuste, receta, producto) puede cambiar lo que se puede vender.
+router.use((req, res, next) => {
+  if (req.method !== 'GET') res.on('finish', () => { if (res.statusCode < 400) scheduleStockCheck(); });
+  next();
+});
 
 router.get('/', async (_req, res) => {
   try {

@@ -17,7 +17,8 @@ import cajaRoutes, { initializeCashSchema } from './routes/caja.js';
 import inventarioRoutes from './routes/inventario.js';
 import ubicacionesRoutes from './routes/ubicaciones.js';
 import extrasRoutes from './routes/extras.js';
-import notificacionesRoutes from './routes/notificaciones.js';
+import notificacionesRoutes, { sendPushToRoles } from './routes/notificaciones.js';
+import { startStockWatch } from './services/stockWatch.js';
 import auditoriaRoutes from './routes/auditoria.js';
 import configuracionRoutes from './routes/configuracion.js';
 import revisionDatosRoutes from './routes/revisionDatos.js';
@@ -112,6 +113,9 @@ await ensureStockReservations();
 const reservations = await migratePendingReservations();
 if (reservations.shortages.length) console.warn('Inventario comprometido por pedidos anteriores: requiere reposicion', reservations.shortages);
 if (reservations.migrated) console.log(`Reservas creadas para ${reservations.migrated} rondas anteriores.`);
+// Vigilante de stock: «queda poco» y agotado automático (avisa a administración en pantalla y al teléfono).
+startStockWatch({ onAlert: (message) => sendPushToRoles(['admin', 'supervisor'], { title: message.title, body: message.body, tag: 'inventario', kind: 'stock', ttl: 3600, urgency: 'normal', data: { type: 'INVENTORY_ALERT' } }) });
+
 httpServer.listen(PORT, () => {
   console.log(`Servidor corriendo en http://localhost:${PORT}`);
 });

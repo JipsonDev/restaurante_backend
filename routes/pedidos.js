@@ -287,10 +287,13 @@ function pickupDetailLines(pedido) {
 async function notifyWaiterOrderReady(pedido, { manual = false, rondaId = null } = {}) {
   if (!pedido) return;
   const target = pedidoUbicacionLabel(pedido);
-  const title = manual ? `Cocina llama: ${target}` : `${target}: ronda lista`;
+  const roundItems = (pedido.items || []).filter((it) => rondaId == null || Number(it.ronda_id) === Number(rondaId));
+  const dishes = roundItems.map((it) => `${it.cantidad}× ${it.nombre}`);
+  const dishText = dishes.length > 3 ? `${dishes.slice(0, 3).join(', ')} y ${dishes.length - 3} más` : dishes.join(', ');
+  const title = manual ? `Cocina te llama: ${target}` : `${target}: lista para llevar`;
   const body = manual
-    ? 'Cocina solicita que el mesero recoja o revise este pedido.'
-    : `Ronda #${rondaId || '-'} del pedido #${pedido.id} lista para recoger.`;
+    ? 'Pasa por cocina a recoger o revisar este pedido.'
+    : dishText ? `${dishText}.` : `Ronda del pedido #${pedido.id} lista para recoger.`;
   const payload = {
     pedido,
     message: body,
@@ -302,6 +305,8 @@ async function notifyWaiterOrderReady(pedido, { manual = false, rondaId = null }
   await sendPushToUser(pedido.mesero_id, {
     title,
     body,
+    tag: manual ? `llama-${pedido.id}` : `listo-${pedido.id}`,
+    kind: manual ? 'call' : 'ready',
     data: {
       type: 'ORDER_READY',
       pedido_id: pedido.id,
@@ -1185,7 +1190,7 @@ router.put('/:id/rondas/:rondaId/platos', verifyRole('admin', 'cocina'), async (
     if (roundReady) await notifyWaiterOrderReady(pedido, { rondaId: round.id }).catch((error) => console.warn('Aviso de ronda pendiente:', error.message));
     else if (listo && names.length) {
       await sendPushToUser(pedido.mesero_id, { title: `${pedidoUbicacionLabel(pedido)}: plato listo`, body: `${names.join(', ')} listo para llevar.`,
-        data: { type: 'ITEMS_READY', pedido_id: pedido.id, mesa_id: pedido.mesa_id, ronda_id: round.id } }).catch(() => {});
+        tag: `listo-${pedido.id}`, kind: 'ready', data: { type: 'ITEMS_READY', pedido_id: pedido.id, mesa_id: pedido.mesa_id, ronda_id: round.id } }).catch(() => {});
     }
     res.json({ pedido, ronda_id: round.id, estado_ronda: estado, ronda_lista: roundReady });
   } catch (error) {
